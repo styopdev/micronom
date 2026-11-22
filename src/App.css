@@ -1049,3 +1049,65 @@ button {
   }
 }
 
+.bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.run-all-button,
+.stop-all-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 39px;
+  padding: 0 15px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: 0.2s;
+}
+
+.run-all-button {
+  color: #75e0ad;
+  background: #173b2e;
+  border: 1px solid #28634b;
+}
+
+.run-all-button:hover {
+  background: #20533e;
+}
+
+.stop-all-button {
+  color: #ff9999;
+  background: #3d2229;
+  border: 1px solid #70404a;
+}
+
+.stop-all-button:hover {
+  background: #592c36;
+}
+
+.run-all-button:disabled,
+.stop-all-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 600px) {
+  .bulk-actions {
+    flex-wrap: wrap;
+  }
+}

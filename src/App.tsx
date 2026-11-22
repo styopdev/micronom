@@ -9,6 +9,9 @@ import {
   Folder,
   LayoutDashboard,
   Plus,
+  Play,
+  Square,
+  LoaderCircle,
   Search,
   Settings,
   Terminal,
@@ -131,6 +134,40 @@ function App() {
       connection.sourceId === activeService ||
       connection.targetId === activeService
   );
+
+  const [bulkLoading, setBulkLoading] = useState(false);
+
+  async function handleBulkAction(action: "run" | "stop") {
+    setBulkLoading(true);
+
+    try {
+      const results = await invoke<
+        { name: string; success: boolean; message: string }[]
+      >(
+        action === "run" ? "run_all_services" : "stop_all_services"
+      );
+
+      const failures = results.filter((result) => !result.success);
+
+      if (failures.length > 0) {
+        alert(
+          failures.map(
+            (result) => `${result.name}: ${result.message}`
+          ).join("\n\n")
+        );
+      } else {
+        alert(
+          action === "run"
+            ? "All microservices started successfully."
+            : "All microservices stopped successfully."
+        );
+      }
+    } catch (error) {
+      alert(`Docker operation failed: ${String(error)}`);
+    } finally {
+      setBulkLoading(false);
+    }
+  }
 
   async function createService() {
     const name = serviceName.trim().toLowerCase().replace(/\s+/g, "-");
@@ -333,6 +370,29 @@ function App() {
         </header>
 
         <div className="page-content">
+          <div className="bulk-actions">
+            <button
+              className="run-all-button"
+              onClick={() => handleBulkAction("run")}
+              disabled={bulkLoading}
+            >
+              {bulkLoading ? (
+                <LoaderCircle size={16} className="spin" />
+              ) : (
+                <Play size={16} />
+              )}
+              Run all
+            </button>
+
+            <button
+              className="stop-all-button"
+              onClick={() => handleBulkAction("stop")}
+              disabled={bulkLoading}
+            >
+              <Square size={15} />
+              Shut down all
+            </button>
+          </div>
           <section className="welcome-section">
             <div>
               <div className="eyebrow">YOUR DEVELOPMENT WORKSPACE</div>

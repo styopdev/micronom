@@ -1,6 +1,7 @@
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn write_file(
     service_dir: &Path,
@@ -439,7 +440,12 @@ Change `HOST_PORT` in `.env` if the selected host port is already in use.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![create_service_folder, remove_service_folder])
+        .invoke_handler(tauri::generate_handler![
+            create_service_folder,
+            remove_service_folder,
+            run_all_services,
+            stop_all_services
+        ])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -497,3 +503,117 @@ fn remove_service_folder(name: String) -> Result<(), String> {
 
     Ok(())
 }
+
+
+#[derive(serde::Serialize)]
+struct ServiceActionResult {
+    name: String,
+    success: bool,
+    message: String,
+}
+
+fn manage_all_services(action: &str) -> Result<Vec<ServiceActionResult>, String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+
+    let app_dir = PathBuf::from(home).join("app");
+
+    if !app_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let canonical_app = app_dir
+        .canonicalize()
+        .map_err(|e| format!("Could not access app directory: {e}"))?;
+
+    let entries = std::fs::read_dir(&canonical_app)
+        .map_err(|e| format!("Could not read app directory: {e}"))?;
+
+    let mut results = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                results.push(ServiceActionResult {
+                    name: "Unknown".into(),
+                    success: false,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+
+        let service_dir = entry.path();
+        let compose_file = service_dir.join("docker-compose.yml");
+
+        if !compose_file.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        let output = if action == "up" {
+            Command::new("docker")
+                .args(["compose", "-f", "docker-compose.yml", "up", "--build", "-d"])
+                .current_dir(&service_dir)
+                .output()
+        } else {
+            Command::new("docker")
+                .args(["compose", "-f", "docker-compose.yml", "down"])
+                .current_dir(&service_dir)
+                .output()
+        };
+
+        match output {
+            Ok(output) => {
+                let success = output.status.success();
+
+                let message = if success {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    String::from_utf8_lossy(&output.stderr).trim().to_string()
+                };
+
+                results.push(ServiceActionResult {
+                    name,
+                    success,
+                    message: if message.is_empty() {
+                        if success {
+                            "Operation completed.".into()
+                        } else {
+                            "Docker operation failed.".into()
+                        }
+                    } else {
+                        message
+                    },
+                });
+            }
+            Err(error) => {
+                results.push(ServiceActionResult {
+                    name,
+                    success: false,
+                    message: format!("Could not execute Docker: {error}"),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+#[tauri::command]
+fn run_all_services() -> Result<Vec<ServiceActionResult>, String> {
+    manage_all_services("up")
+}
+
+#[tauri::command]
+fn stop_all_services() -> Result<Vec<ServiceActionResult>, String> {
+    manage_all_services("down")
+}
+
