@@ -53,6 +53,8 @@ function App() {
     try {
       const folderPath = await invoke<string>("create_service_folder", {
         name,
+        language,
+        framework: selectedLanguage.framework,
       });
 
       const service: Service = {
