@@ -1,6 +1,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   Boxes,
@@ -58,6 +59,11 @@ type CommandExecution = {
   command: string;
   success: boolean;
   output: string;
+};
+
+type ServiceActionProgress = {
+  name: string;
+  message: string;
 };
 
 type StoredWorkspace = {
@@ -300,6 +306,7 @@ function App() {
   );
 
   const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<ServiceActionProgress[]>([]);
 
   function persistWorkspaceState(
     nextServices = services,
@@ -412,8 +419,19 @@ function App() {
 
   async function handleBulkAction(action: "run" | "stop") {
     setBulkLoading(true);
+    setBulkProgress([]);
+    let unlisten: (() => void) | undefined;
 
     try {
+      if (isTauri()) {
+        unlisten = await listen<ServiceActionProgress>(
+          "service-action-progress",
+          ({ payload }) => {
+            setBulkProgress((current) => [...current.slice(-199), payload]);
+          }
+        );
+      }
+
       const results = await invoke<
         { name: string; success: boolean; message: string }[]
       >(
@@ -438,6 +456,7 @@ function App() {
     } catch (error) {
       alert(`Docker operation failed: ${String(error)}`);
     } finally {
+      unlisten?.();
       setBulkLoading(false);
     }
   }
@@ -682,6 +701,15 @@ function App() {
               Shut down all
             </button>
           </div>
+          {bulkProgress.length > 0 && (
+            <div className="bulk-progress" role="status" aria-live="polite">
+              {bulkProgress.map((entry, index) => (
+                <p key={`${entry.name}-${index}`}>
+                  <strong>{entry.name}:</strong> {entry.message}
+                </p>
+              ))}
+            </div>
+          )}
           <section className="welcome-section">
             <div>
               <div className="eyebrow">YOUR DEVELOPMENT WORKSPACE</div>

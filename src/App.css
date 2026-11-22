@@ -1166,6 +1166,27 @@ button {
   gap: 10px;
 }
 
+.bulk-progress {
+  max-height: 180px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  color: #b6c4d2;
+  background: #101923;
+  border: 1px solid #263645;
+  border-radius: 8px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.bulk-progress p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.bulk-progress strong {
+  color: #75e0ad;
+}
+
 .run-all-button,
 .stop-all-button {
   display: inline-flex;

@@ -1,12 +1,14 @@
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::Emitter;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
 
 fn write_file(
@@ -933,7 +935,134 @@ struct ServiceActionResult {
     message: String,
 }
 
-fn manage_all_services(action: &str) -> Result<Vec<ServiceActionResult>, String> {
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceActionProgress {
+    name: String,
+    message: String,
+}
+
+fn emit_service_progress(app: &tauri::AppHandle, name: &str, message: String) {
+    if let Err(error) = app.emit(
+        "service-action-progress",
+        ServiceActionProgress {
+            name: name.to_string(),
+            message,
+        },
+    ) {
+        log::warn!("Could not report Docker progress for {name}: {error}");
+    }
+}
+
+fn forward_compose_output<R: Read + Send + 'static>(
+    reader: R,
+    app: tauri::AppHandle,
+    name: String,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    emit_service_progress(&app, &name, line);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    emit_service_progress(
+                        &app,
+                        &name,
+                        format!("Could not read Docker output: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn run_compose(
+    app: &tauri::AppHandle,
+    service_dir: &Path,
+    name: &str,
+    action: &str,
+) -> Result<ExitStatus, String> {
+    emit_service_progress(
+        app,
+        name,
+        if action == "up" {
+            "Building and starting containers...".into()
+        } else {
+            "Stopping containers...".into()
+        },
+    );
+
+    let mut command = Command::new("docker");
+    if action == "up" {
+        command.args([
+            "compose",
+            "--progress",
+            "plain",
+            "-f",
+            "docker-compose.yml",
+            "up",
+            "--build",
+            "-d",
+        ]);
+    } else {
+        command.args(["compose", "-f", "docker-compose.yml", "down"]);
+    }
+
+    let mut child = command
+        .current_dir(service_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not execute Docker: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture Docker output.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not capture Docker errors.".to_string())?;
+    let stdout_reader = forward_compose_output(stdout, app.clone(), name.to_string());
+    let stderr_reader = forward_compose_output(stderr, app.clone(), name.to_string());
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("Could not monitor Docker: {error}"));
+            }
+        }
+
+        if started.elapsed() >= DOCKER_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(format!(
+                "Docker operation exceeded the {}-second limit.",
+                DOCKER_COMMAND_TIMEOUT.as_secs()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    status
+}
+
+fn manage_all_services(
+    action: &str,
+    app: &tauri::AppHandle,
+) -> Result<Vec<ServiceActionResult>, String> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .ok_or_else(|| "Could not find the user home directory.".to_string())?;
@@ -979,47 +1108,27 @@ fn manage_all_services(action: &str) -> Result<Vec<ServiceActionResult>, String>
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        let output = if action == "up" {
-            Command::new("docker")
-                .args(["compose", "-f", "docker-compose.yml", "up", "--build", "-d"])
-                .current_dir(&service_dir)
-                .output()
-        } else {
-            Command::new("docker")
-                .args(["compose", "-f", "docker-compose.yml", "down"])
-                .current_dir(&service_dir)
-                .output()
-        };
-
-        match output {
-            Ok(output) => {
-                let success = output.status.success();
-
+        match run_compose(app, &service_dir, &name, action) {
+            Ok(status) => {
+                let success = status.success();
                 let message = if success {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    "Operation completed.".into()
                 } else {
-                    String::from_utf8_lossy(&output.stderr).trim().to_string()
+                    format!("Docker operation failed ({status}).")
                 };
-
+                emit_service_progress(app, &name, message.clone());
                 results.push(ServiceActionResult {
                     name,
                     success,
-                    message: if message.is_empty() {
-                        if success {
-                            "Operation completed.".into()
-                        } else {
-                            "Docker operation failed.".into()
-                        }
-                    } else {
-                        message
-                    },
+                    message,
                 });
             }
-            Err(error) => {
+            Err(message) => {
+                emit_service_progress(app, &name, message.clone());
                 results.push(ServiceActionResult {
                     name,
                     success: false,
-                    message: format!("Could not execute Docker: {error}"),
+                    message,
                 });
             }
         }
@@ -1029,12 +1138,16 @@ fn manage_all_services(action: &str) -> Result<Vec<ServiceActionResult>, String>
 }
 
 #[tauri::command]
-fn run_all_services() -> Result<Vec<ServiceActionResult>, String> {
-    manage_all_services("up")
+async fn run_all_services(app: tauri::AppHandle) -> Result<Vec<ServiceActionResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || manage_all_services("up", &app))
+        .await
+        .map_err(|error| format!("Docker task failed: {error}"))?
 }
 
 #[tauri::command]
-fn stop_all_services() -> Result<Vec<ServiceActionResult>, String> {
-    manage_all_services("down")
+async fn stop_all_services(app: tauri::AppHandle) -> Result<Vec<ServiceActionResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || manage_all_services("down", &app))
+        .await
+        .map_err(|error| format!("Docker task failed: {error}"))?
 }
 
