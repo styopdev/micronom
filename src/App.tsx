@@ -16,6 +16,13 @@ import {
   X,
   Server,
   Cpu,
+  Network,
+  RadioTower,
+  Globe,
+  Webhook,
+  ArrowRight,
+  MessageSquare,
+  Trash2,
 } from "lucide-react";
 import "./App.css";
 
@@ -27,6 +34,16 @@ type Service = {
   status: "Created";
 };
 
+type ConnectionMethod = "Messaging" | "REST API" | "gRPC" | "Webhooks";
+
+type Connection = {
+  id: number;
+  sourceId: number;
+  targetId: number;
+  method: ConnectionMethod;
+  broker: string | null;
+};
+
 const languages = [
   { name: "Node.js", framework: "Express", icon: "JS" },
   { name: "Python", framework: "FastAPI", icon: "PY" },
@@ -34,16 +51,86 @@ const languages = [
   { name: "Rust", framework: "Axum", icon: "RS" },
 ];
 
+const methods: {
+  name: ConnectionMethod;
+  description: string;
+  icon: typeof Network;
+}[] = [
+  {
+    name: "Messaging",
+    description: "Asynchronous communication through message brokers.",
+    icon: RadioTower,
+  },
+  {
+    name: "REST API",
+    description: "HTTP requests between microservices.",
+    icon: Globe,
+  },
+  {
+    name: "gRPC",
+    description: "Fast, strongly typed service communication.",
+    icon: Network,
+  },
+  {
+    name: "Webhooks",
+    description: "Send event notifications between services.",
+    icon: Webhook,
+  },
+];
+
+const brokers = [
+  {
+    name: "RabbitMQ",
+    description: "Reliable message queues and routing.",
+    icon: "RMQ",
+  },
+  {
+    name: "Apache Kafka",
+    description: "Distributed event streaming.",
+    icon: "KFK",
+  },
+  {
+    name: "Redis Streams",
+    description: "Lightweight stream-based messaging.",
+    icon: "RED",
+  },
+];
+
 function App() {
   const [services, setServices] = useState<Service[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
+
   const [modalOpen, setModalOpen] = useState(false);
+  const [connectionModalOpen, setConnectionModalOpen] = useState(false);
+
   const [serviceName, setServiceName] = useState("");
   const [language, setLanguage] = useState("Node.js");
   const [activeService, setActiveService] = useState<number | null>(null);
 
+  const [connectionMethod, setConnectionMethod] =
+    useState<ConnectionMethod>("Messaging");
+  const [selectedBroker, setSelectedBroker] = useState("RabbitMQ");
+  const [targetServiceId, setTargetServiceId] = useState<number | "">("");
+
+  const [connectionError, setConnectionError] = useState("");
+
   const selectedLanguage = languages.find(
     (item) => item.name === language
   )!;
+
+  const selectedService = services.find(
+    (service) => service.id === activeService
+  );
+
+  const targetServices = services.filter(
+    (service) => service.id !== activeService
+  );
+
+  const serviceConnections = connections.filter(
+    (connection) =>
+      connection.sourceId === activeService ||
+      connection.targetId === activeService
+  );
 
   async function createService() {
     const name = serviceName.trim().toLowerCase().replace(/\s+/g, "-");
@@ -77,9 +164,92 @@ function App() {
     }
   }
 
-  const selectedService = services.find(
-    (service) => service.id === activeService
-  );
+  async function removeService() {
+    if (!selectedService) return;
+
+    const confirmed = window.confirm(
+      `Permanently delete "${selectedService.name}"?\n\n` +
+      `This will delete its files and folders from your app directory. ` +
+      `This action cannot be undone.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await invoke("remove_service_folder", {
+        name: selectedService.name,
+      });
+
+      const removedId = selectedService.id;
+
+      setServices((previous) =>
+        previous.filter((service) => service.id !== removedId)
+      );
+
+      setConnections((previous) =>
+        previous.filter(
+          (connection) =>
+            connection.sourceId !== removedId &&
+            connection.targetId !== removedId
+        )
+      );
+
+      setActiveService(null);
+    } catch (error) {
+      alert(`Could not remove microservice:\n${String(error)}`);
+    }
+  }
+
+  function openConnectionModal() {
+    setConnectionMethod("Messaging");
+    setSelectedBroker("RabbitMQ");
+    setTargetServiceId("");
+    setConnectionError("");
+    setConnectionModalOpen(true);
+  }
+
+  function createConnection() {
+    if (activeService === null || targetServiceId === "") {
+      setConnectionError("Please select a destination microservice.");
+      return;
+    }
+
+    if (activeService === targetServiceId) {
+      setConnectionError("A service cannot connect to itself.");
+      return;
+    }
+
+    const alreadyExists = connections.some(
+      (connection) =>
+        connection.sourceId === activeService &&
+        connection.targetId === targetServiceId &&
+        connection.method === connectionMethod &&
+        connection.broker ===
+          (connectionMethod === "Messaging" ? selectedBroker : null)
+    );
+
+    if (alreadyExists) {
+      setConnectionError("This connection already exists.");
+      return;
+    }
+
+    const newConnection: Connection = {
+      id: Date.now(),
+      sourceId: activeService,
+      targetId: targetServiceId,
+      method: connectionMethod,
+      broker:
+        connectionMethod === "Messaging" ? selectedBroker : null,
+    };
+
+    setConnections((previous) => [...previous, newConnection]);
+    setConnectionModalOpen(false);
+    setConnectionError("");
+  }
+
+  function getServiceName(id: number) {
+    return services.find((service) => service.id === id)?.name ?? "Unknown";
+  }
 
   return (
     <div className="app-shell">
@@ -110,6 +280,12 @@ function App() {
         <button className="nav-item">
           <Database size={17} />
           Databases
+        </button>
+
+        <button className="nav-item">
+          <Network size={17} />
+          Connections
+          <span className="nav-count">{connections.length}</span>
         </button>
 
         <button className="nav-item">
@@ -186,11 +362,11 @@ function App() {
 
             <div className="stat-card">
               <div className="stat-top">
-                <span>DATABASES</span>
-                <Database size={18} />
+                <span>CONNECTIONS</span>
+                <Network size={18} />
               </div>
-              <div className="stat-value">0</div>
-              <div className="stat-description">Configured databases</div>
+              <div className="stat-value">{connections.length}</div>
+              <div className="stat-description">Configured connections</div>
             </div>
 
             <div className="stat-card">
@@ -278,6 +454,16 @@ function App() {
                     {selectedService.language} · {selectedService.framework}
                   </p>
                 </div>
+
+              <div className="service-header-actions">
+                <button
+                  className="danger-button"
+                  onClick={removeService}
+                >
+                  <Trash2 size={16} />
+                  Remove microservice
+                </button>
+
                 <button
                   className="icon-button"
                   onClick={() => setActiveService(null)}
@@ -286,6 +472,85 @@ function App() {
                   <X size={18} />
                 </button>
               </div>
+              </div>
+
+              <div className="connection-panel">
+                <div className="connection-panel-heading">
+                  <div>
+                    <h3>Service connections</h3>
+                    <p>Connect this microservice to other services.</p>
+                  </div>
+                  <button
+                    className="primary-button"
+                    onClick={openConnectionModal}
+                    disabled={services.length < 2}
+                    title={
+                      services.length < 2
+                        ? "Create another microservice first"
+                        : "Create a connection"
+                    }
+                  >
+                    <Plus size={17} />
+                    Connect
+                  </button>
+                </div>
+
+                {serviceConnections.length === 0 ? (
+                  <div className="connection-empty">
+                    <div className="empty-icon">
+                      <Network size={26} />
+                    </div>
+                    <h3>No connections yet</h3>
+                    <p>
+                      Connect {selectedService.name} to another microservice
+                      using messaging, REST, gRPC or webhooks.
+                    </p>
+                    {services.length < 2 && (
+                      <small>Create at least two microservices to connect them.</small>
+                    )}
+                  </div>
+                ) : (
+                  <div className="connection-list">
+                    {serviceConnections.map((connection) => {
+                      const isOutgoing =
+                        connection.sourceId === selectedService.id;
+
+                      return (
+                        <div className="connection-item" key={connection.id}>
+                          <div className="connection-item-icon">
+                            {connection.method === "Messaging" ? (
+                              <RadioTower size={19} />
+                            ) : connection.method === "REST API" ? (
+                              <Globe size={19} />
+                            ) : connection.method === "gRPC" ? (
+                              <Network size={19} />
+                            ) : (
+                              <Webhook size={19} />
+                            )}
+                          </div>
+                          <div className="connection-item-info">
+                            <strong>
+                              {isOutgoing
+                                ? `To ${getServiceName(connection.targetId)}`
+                                : `From ${getServiceName(connection.sourceId)}`}
+                            </strong>
+                            <span>
+                              {connection.method}
+                              {connection.broker
+                                ? ` · ${connection.broker}`
+                                : ""}
+                            </span>
+                          </div>
+                          <span className="connection-direction">
+                            {isOutgoing ? "Outgoing" : "Incoming"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
               <div className="workspace-placeholder">
                 <Folder size={26} />
                 <h3>Service workspace</h3>
@@ -369,6 +634,155 @@ function App() {
               >
                 <Plus size={17} />
                 Create service
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {connectionModalOpen && selectedService && (
+        <div
+          className="modal-overlay"
+          onClick={() => setConnectionModalOpen(false)}
+        >
+          <div
+            className="modal connection-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <div className="eyebrow">SERVICE CONNECTION</div>
+                <h2>Connect microservice</h2>
+                <p>Configure communication for {selectedService.name}.</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setConnectionModalOpen(false)}
+              >
+                <X size={19} />
+              </button>
+            </div>
+
+            <label className="field-label">1. COMMUNICATION METHOD</label>
+
+            <div className="connection-method-grid">
+              {methods.map((method) => {
+                const Icon = method.icon;
+
+                return (
+                  <button
+                    key={method.name}
+                    className={`connection-method-option ${
+                      connectionMethod === method.name ? "selected" : ""
+                    }`}
+                    onClick={() => {
+                      setConnectionMethod(method.name);
+                      setConnectionError("");
+                    }}
+                  >
+                    <Icon size={21} />
+                    <strong>{method.name}</strong>
+                    <small>{method.description}</small>
+                  </button>
+                );
+              })}
+            </div>
+
+            {connectionMethod === "Messaging" && (
+              <>
+                <label className="field-label connection-field-label">
+                  2. SELECT MESSAGE BROKER
+                </label>
+
+                <div className="broker-grid">
+                  {brokers.map((broker) => (
+                    <button
+                      key={broker.name}
+                      className={`broker-option ${
+                        selectedBroker === broker.name ? "selected" : ""
+                      }`}
+                      onClick={() => setSelectedBroker(broker.name)}
+                    >
+                      <span className="broker-icon">{broker.icon}</span>
+                      <span className="broker-info">
+                        <strong>{broker.name}</strong>
+                        <small>{broker.description}</small>
+                      </span>
+                      <span className="language-radio">
+                        {selectedBroker === broker.name ? "✓" : ""}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <label className="field-label connection-field-label">
+              {connectionMethod === "Messaging" ? "3." : "2."} DESTINATION MICROSERVICE
+            </label>
+
+            <select
+              className="text-input connection-select"
+              value={targetServiceId}
+              onChange={(event) => {
+                setTargetServiceId(
+                  event.target.value === ""
+                    ? ""
+                    : Number(event.target.value)
+                );
+                setConnectionError("");
+              }}
+            >
+              <option value="">Select a microservice...</option>
+              {targetServices.map((service) => (
+                <option key={service.id} value={service.id}>
+                  {service.name} — {service.language}
+                </option>
+              ))}
+            </select>
+
+            <div className="connection-preview">
+              <div className="connection-preview-service">
+                <Server size={18} />
+                <span>{selectedService.name}</span>
+              </div>
+              <ArrowRight size={18} />
+              <div className="connection-preview-service">
+                <Server size={18} />
+                <span>
+                  {targetServiceId === ""
+                    ? "Destination"
+                    : getServiceName(targetServiceId)}
+                </span>
+              </div>
+            </div>
+
+            {connectionError && (
+              <div className="connection-error">{connectionError}</div>
+            )}
+
+            <div className="connection-note">
+              <MessageSquare size={16} />
+              <span>
+                This creates a connection configuration in Micronom.
+                Docker deployment and code generation will be added next.
+              </span>
+            </div>
+
+            <div className="modal-footer">
+              <button
+                className="secondary-button"
+                onClick={() => setConnectionModalOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                onClick={createConnection}
+                disabled={targetServices.length === 0}
+              >
+                <Network size={17} />
+                Create connection
               </button>
             </div>
           </div>

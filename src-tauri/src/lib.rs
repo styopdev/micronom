@@ -439,7 +439,7 @@ Change `HOST_PORT` in `.env` if the selected host port is already in use.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![create_service_folder])
+        .invoke_handler(tauri::generate_handler![create_service_folder, remove_service_folder])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -453,4 +453,47 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while building tauri application");
+}
+
+#[tauri::command]
+fn remove_service_folder(name: String) -> Result<(), String> {
+    use std::fs;
+
+    // Only allow safe service folder names.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid microservice name.".to_string());
+    }
+
+    let home = std::env::var("USERPROFILE")
+        .map_err(|_| "Could not find the user profile directory.".to_string())?;
+
+    let app_dir = std::path::PathBuf::from(home).join("app");
+
+    let canonical_app = app_dir
+        .canonicalize()
+        .map_err(|_| "Micronom app directory does not exist.".to_string())?;
+
+    let service_path = canonical_app.join(&name);
+
+    let canonical_service = service_path
+        .canonicalize()
+        .map_err(|_| "Microservice folder was not found.".to_string())?;
+
+    // Only allow deleting a direct child of the app directory.
+    if canonical_service.parent() != Some(canonical_app.as_path()) {
+        return Err("Invalid microservice directory.".to_string());
+    }
+
+    if !canonical_service.is_dir() {
+        return Err("The microservice path is not a directory.".to_string());
+    }
+
+    fs::remove_dir_all(&canonical_service)
+        .map_err(|error| format!("Failed to delete microservice: {}", error))?;
+
+    Ok(())
 }
