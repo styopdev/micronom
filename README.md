@@ -2,7 +2,7 @@
 
 **Build. Connect. Orchestrate.**
 
-Micronom is an AI-powered desktop application for creating, managing, and orchestrating microservices from a single workspace.
+Micronom is an AI-powered UI based framework for creating, managing, and orchestrating microservices from a single workspace.
 
 It provides a unified environment where developers can create microservices using different programming languages and frameworks, manage their projects, and eventually use AI to generate and modify service code.
 
@@ -11,7 +11,7 @@ It provides a unified environment where developers can create microservices usin
 ## Features
 
 - **Desktop application:** Built with Tauri 2, React, TypeScript, and Vite.
-- **Microservice management:** Create and manage microservices from a central dashboard.
+- **Microservice management:** Create and manage microservices from a central dashboard with UI.
 - **Multiple languages:** Planned support for Node.js, Python, Go, and Rust.
 - **Automatic workspace creation:** Micronom creates an `app` directory in the user's home directory when the first service is created.
 - **Independent projects:** Each microservice gets its own directory.
