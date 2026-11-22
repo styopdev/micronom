@@ -1,12 +1,11 @@
 
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   Activity,
   Boxes,
   Code2,
   Database,
-  Folder,
   LayoutDashboard,
   Plus,
   Play,
@@ -26,6 +25,8 @@ import {
   ArrowRight,
   MessageSquare,
   Trash2,
+  Sparkles,
+  Send,
 } from "lucide-react";
 import "./App.css";
 
@@ -46,6 +47,27 @@ type Connection = {
   method: ConnectionMethod;
   broker: string | null;
 };
+
+type AiSuggestion = {
+  commandId: string | null;
+  command: string | null;
+  explanation: string;
+};
+
+type CommandExecution = {
+  command: string;
+  success: boolean;
+  output: string;
+};
+
+type StoredWorkspace = {
+  version: 1;
+  services: Service[];
+  connections: Connection[];
+  activeServiceId: number | null;
+};
+
+const workspaceStorageKey = "micronom.workspace";
 
 const languages = [
   { name: "Node.js", framework: "Express", icon: "JS" },
@@ -99,16 +121,152 @@ const brokers = [
   },
 ];
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+function isService(value: unknown): value is Service {
+  return (
+    isRecord(value) &&
+    isSafeInteger(value.id) &&
+    typeof value.name === "string" &&
+    typeof value.language === "string" &&
+    typeof value.framework === "string" &&
+    value.status === "Created"
+  );
+}
+
+function isConnection(value: unknown): value is Connection {
+  return (
+    isRecord(value) &&
+    isSafeInteger(value.id) &&
+    isSafeInteger(value.sourceId) &&
+    isSafeInteger(value.targetId) &&
+    typeof value.method === "string" &&
+    methods.some((method) => method.name === value.method) &&
+    (typeof value.broker === "string" || value.broker === null)
+  );
+}
+
+function isStoredWorkspace(value: unknown): value is StoredWorkspace {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    !Array.isArray(value.services) ||
+    !value.services.every(isService) ||
+    !Array.isArray(value.connections) ||
+    !value.connections.every(isConnection)
+  ) {
+    return false;
+  }
+
+  const services = value.services.filter(isService);
+  const connections = value.connections.filter(isConnection);
+  if (
+    services.length !== value.services.length ||
+    connections.length !== value.connections.length
+  ) {
+    return false;
+  }
+
+  const serviceIds = new Set(services.map((service) => service.id));
+  const connectionIds = new Set(connections.map((connection) => connection.id));
+  const serviceIdsAreUnique = serviceIds.size === services.length;
+  const connectionIdsAreUnique = connectionIds.size === connections.length;
+  const connectionsHaveValidServices = connections.every(
+    (connection) =>
+      connection.sourceId !== connection.targetId &&
+      serviceIds.has(connection.sourceId) &&
+      serviceIds.has(connection.targetId)
+  );
+
+  return (
+    serviceIdsAreUnique &&
+    connectionIdsAreUnique &&
+    connectionsHaveValidServices &&
+    (value.activeServiceId === null ||
+      (isSafeInteger(value.activeServiceId) &&
+        serviceIds.has(value.activeServiceId)))
+  );
+}
+
+function saveWorkspace(workspace: StoredWorkspace): string | null {
+  try {
+    window.localStorage.setItem(workspaceStorageKey, JSON.stringify(workspace));
+    return null;
+  } catch (error) {
+    return `Could not save workspace: ${String(error)}`;
+  }
+}
+
+function readStoredWorkspace(): {
+  workspace: StoredWorkspace;
+  hasSavedWorkspace: boolean;
+  error: string | null;
+} {
+  try {
+    const saved = window.localStorage.getItem(workspaceStorageKey);
+    if (saved === null) {
+      return {
+        workspace: {
+          version: 1,
+          services: [],
+          connections: [],
+          activeServiceId: null,
+        },
+        hasSavedWorkspace: false,
+        error: null,
+      };
+    }
+
+    const workspace: unknown = JSON.parse(saved);
+    if (!isStoredWorkspace(workspace)) {
+      throw new Error("Saved workspace data is invalid.");
+    }
+
+    return { workspace, hasSavedWorkspace: true, error: null };
+  } catch (error) {
+    return {
+      workspace: {
+        version: 1,
+        services: [],
+        connections: [],
+        activeServiceId: null,
+      },
+      hasSavedWorkspace: true,
+      error: `Could not load saved workspace: ${String(error)}`,
+    };
+  }
+}
+
 function App() {
-  const [services, setServices] = useState<Service[]>([]);
-  const [connections, setConnections] = useState<Connection[]>([]);
+  const [savedWorkspace] = useState(readStoredWorkspace);
+  const [services, setServices] = useState(savedWorkspace.workspace.services);
+  const [connections, setConnections] = useState(
+    savedWorkspace.workspace.connections
+  );
+  const [workspaceHydrated, setWorkspaceHydrated] = useState(
+    savedWorkspace.hasSavedWorkspace || !isTauri()
+  );
+  const [workspaceStorageError, setWorkspaceStorageError] = useState(
+    savedWorkspace.error
+  );
 
   const [modalOpen, setModalOpen] = useState(false);
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
 
   const [serviceName, setServiceName] = useState("");
   const [language, setLanguage] = useState("Node.js");
-  const [activeService, setActiveService] = useState<number | null>(null);
+  const [activeService, setActiveService] = useState<number | null>(
+    savedWorkspace.workspace.activeServiceId
+  );
+  const activeServiceRef = useRef<number | null>(
+    savedWorkspace.workspace.activeServiceId
+  );
 
   const [connectionMethod, setConnectionMethod] =
     useState<ConnectionMethod>("Messaging");
@@ -116,6 +274,12 @@ function App() {
   const [targetServiceId, setTargetServiceId] = useState<number | "">("");
 
   const [connectionError, setConnectionError] = useState("");
+  const [aiModel, setAiModel] = useState("qwen2.5-coder:7b");
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiSuggestion, setAiSuggestion] = useState<AiSuggestion | null>(null);
+  const [aiExecution, setAiExecution] = useState<CommandExecution | null>(null);
+  const [aiError, setAiError] = useState("");
+  const [aiBusy, setAiBusy] = useState<"suggesting" | "running" | null>(null);
 
   const selectedLanguage = languages.find(
     (item) => item.name === language
@@ -136,6 +300,115 @@ function App() {
   );
 
   const [bulkLoading, setBulkLoading] = useState(false);
+
+  function persistWorkspaceState(
+    nextServices = services,
+    nextConnections = connections,
+    nextActiveServiceId = activeService
+  ) {
+    if (workspaceStorageError) return;
+
+    const error = saveWorkspace({
+      version: 1,
+      services: nextServices,
+      connections: nextConnections,
+      activeServiceId: nextActiveServiceId,
+    });
+    if (error) setWorkspaceStorageError(error);
+  }
+
+  function selectService(serviceId: number | null) {
+    setActiveService(serviceId);
+    activeServiceRef.current = serviceId;
+  }
+
+  useEffect(() => {
+    if (savedWorkspace.hasSavedWorkspace || !isTauri()) return;
+
+    let cancelled = false;
+    invoke<{ name: string; language: string; framework: string }[]>(
+      "list_service_folders"
+    )
+      .then((existingServices) => {
+        if (cancelled) return;
+
+        const restoredServices: Service[] = existingServices.map(
+          (service, index) => ({
+            ...service,
+            id: index + 1,
+            status: "Created",
+          })
+        );
+        setServices(restoredServices);
+        const saveError = saveWorkspace({
+          version: 1,
+          services: restoredServices,
+          connections: [],
+          activeServiceId: null,
+        });
+        if (saveError) setWorkspaceStorageError(saveError);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setWorkspaceStorageError(
+            `Could not restore existing services: ${String(error)}`
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setWorkspaceHydrated(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [savedWorkspace.hasSavedWorkspace]);
+
+  async function askAiForCommand() {
+    if (!selectedService || !aiPrompt.trim()) return;
+    const serviceId = selectedService.id;
+
+    setAiBusy("suggesting");
+    setAiError("");
+    setAiSuggestion(null);
+    setAiExecution(null);
+
+    try {
+      const suggestion = await invoke<AiSuggestion>("suggest_service_command", {
+        model: aiModel.trim(),
+        prompt: aiPrompt.trim(),
+        language: selectedService.language,
+        framework: selectedService.framework,
+      });
+      if (activeServiceRef.current === serviceId) setAiSuggestion(suggestion);
+    } catch (error) {
+      if (activeServiceRef.current === serviceId) setAiError(String(error));
+    } finally {
+      setAiBusy(null);
+    }
+  }
+
+  async function runSuggestedCommand() {
+    if (!selectedService || !aiSuggestion?.commandId) return;
+    const serviceId = selectedService.id;
+
+    setAiBusy("running");
+    setAiError("");
+    setAiExecution(null);
+
+    try {
+      const result = await invoke<CommandExecution>("execute_service_command", {
+        serviceName: selectedService.name,
+        commandId: aiSuggestion.commandId,
+        language: selectedService.language,
+      });
+      if (activeServiceRef.current === serviceId) setAiExecution(result);
+    } catch (error) {
+      if (activeServiceRef.current === serviceId) setAiError(String(error));
+    } finally {
+      setAiBusy(null);
+    }
+  }
 
   async function handleBulkAction(action: "run" | "stop") {
     setBulkLoading(true);
@@ -182,15 +455,20 @@ function App() {
       });
 
       const service: Service = {
-        id: Date.now(),
+        id: services.reduce(
+          (highestId, existing) => Math.max(highestId, existing.id),
+          0
+        ) + 1,
         name,
         language,
         framework: selectedLanguage.framework,
         status: "Created",
       };
 
-      setServices((previous) => [...previous, service]);
-      setActiveService(service.id);
+      const nextServices = [...services, service];
+      setServices(nextServices);
+      selectService(service.id);
+      persistWorkspaceState(nextServices, connections, service.id);
       setServiceName("");
       setModalOpen(false);
 
@@ -218,20 +496,19 @@ function App() {
       });
 
       const removedId = selectedService.id;
-
-      setServices((previous) =>
-        previous.filter((service) => service.id !== removedId)
+      const nextServices = services.filter(
+        (service) => service.id !== removedId
+      );
+      const nextConnections = connections.filter(
+        (connection) =>
+          connection.sourceId !== removedId &&
+          connection.targetId !== removedId
       );
 
-      setConnections((previous) =>
-        previous.filter(
-          (connection) =>
-            connection.sourceId !== removedId &&
-            connection.targetId !== removedId
-        )
-      );
-
-      setActiveService(null);
+      setServices(nextServices);
+      setConnections(nextConnections);
+      selectService(null);
+      persistWorkspaceState(nextServices, nextConnections, null);
     } catch (error) {
       alert(`Could not remove microservice:\n${String(error)}`);
     }
@@ -271,7 +548,11 @@ function App() {
     }
 
     const newConnection: Connection = {
-      id: Date.now(),
+      id:
+        connections.reduce(
+          (highestId, existing) => Math.max(highestId, existing.id),
+          0
+        ) + 1,
       sourceId: activeService,
       targetId: targetServiceId,
       method: connectionMethod,
@@ -279,7 +560,9 @@ function App() {
         connectionMethod === "Messaging" ? selectedBroker : null,
     };
 
-    setConnections((previous) => [...previous, newConnection]);
+    const nextConnections = [...connections, newConnection];
+    setConnections(nextConnections);
+    persistWorkspaceState(services, nextConnections, activeService);
     setConnectionModalOpen(false);
     setConnectionError("");
   }
@@ -370,6 +653,12 @@ function App() {
         </header>
 
         <div className="page-content">
+          {workspaceStorageError && (
+            <div className="workspace-storage-error" role="alert">
+              {workspaceStorageError}
+            </div>
+          )}
+
           <div className="bulk-actions">
             <button
               className="run-all-button"
@@ -396,7 +685,6 @@ function App() {
           <section className="welcome-section">
             <div>
               <div className="eyebrow">YOUR DEVELOPMENT WORKSPACE</div>
-              <h1>Welcome to Micronom.</h1>
               <p>
                 Design, build and orchestrate your microservices in one place.
               </p>
@@ -404,6 +692,7 @@ function App() {
             <button
               className="primary-button"
               onClick={() => setModalOpen(true)}
+              disabled={!workspaceHydrated}
             >
               <Plus size={18} />
               Add microservice
@@ -453,6 +742,7 @@ function App() {
                 <button
                   className="secondary-button"
                   onClick={() => setModalOpen(true)}
+                  disabled={!workspaceHydrated}
                 >
                   <Plus size={16} />
                   New service
@@ -460,7 +750,13 @@ function App() {
               </div>
             </div>
 
-            {services.length === 0 ? (
+            {!workspaceHydrated ? (
+              <div className="empty-state">
+                <LoaderCircle size={26} className="spin" />
+                <h3>Restoring workspace</h3>
+                <p>Loading your saved microservices.</p>
+              </div>
+            ) : services.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">
                   <Boxes size={30} />
@@ -486,7 +782,13 @@ function App() {
                       activeService === service.id ? "selected" : ""
                     }`}
                     key={service.id}
-                    onClick={() => setActiveService(service.id)}
+                    onClick={() => {
+                    selectService(service.id);
+                    persistWorkspaceState(services, connections, service.id);
+                      setAiSuggestion(null);
+                      setAiExecution(null);
+                      setAiError("");
+                    }}
                   >
                     <div className="service-card-top">
                       <div className="service-icon">
@@ -526,7 +828,10 @@ function App() {
 
                 <button
                   className="icon-button"
-                  onClick={() => setActiveService(null)}
+                  onClick={() => {
+                    selectService(null);
+                    persistWorkspaceState(services, connections, null);
+                  }}
                   title="Close service"
                 >
                   <X size={18} />
@@ -611,13 +916,109 @@ function App() {
                 )}
               </div>
 
-              <div className="workspace-placeholder">
-                <Folder size={26} />
-                <h3>Service workspace</h3>
-                <p>
-                  Code editor, AI prompt, database configuration and logs
-                  will live here.
+              <div className="ai-panel">
+                <div className="ai-panel-heading">
+                  <div className="ai-panel-icon">
+                    <Sparkles size={19} />
+                  </div>
+                  <div>
+                    <h3>AI command assistant</h3>
+                    <p>Ask local Ollama to recommend a development command.</p>
+                  </div>
+                </div>
+
+                <label className="ai-model-label" htmlFor="ollama-model">
+                  OLLAMA MODEL
+                </label>
+                <input
+                  id="ollama-model"
+                  className="ai-input"
+                  value={aiModel}
+                  onChange={(event) => {
+                    setAiModel(event.target.value);
+                    setAiSuggestion(null);
+                    setAiExecution(null);
+                    setAiError("");
+                  }}
+                  placeholder="e.g. qwen2.5-coder:7b"
+                  disabled={aiBusy !== null}
+                />
+
+                <label className="ai-model-label" htmlFor="ai-request">
+                  WHAT SHOULD I DO?
+                </label>
+                <textarea
+                  id="ai-request"
+                  className="ai-input ai-prompt"
+                  value={aiPrompt}
+                  onChange={(event) => {
+                    setAiPrompt(event.target.value);
+                    setAiSuggestion(null);
+                    setAiExecution(null);
+                    setAiError("");
+                  }}
+                  placeholder="e.g. Install this service's dependencies"
+                  maxLength={4000}
+                  disabled={aiBusy !== null}
+                />
+
+                <div className="ai-actions">
+                  <button
+                    className="primary-button"
+                    onClick={askAiForCommand}
+                    disabled={aiBusy !== null || !aiPrompt.trim() || !aiModel.trim()}
+                  >
+                    {aiBusy === "suggesting" ? (
+                      <LoaderCircle size={16} className="spin" />
+                    ) : (
+                      <Send size={16} />
+                    )}
+                    Ask AI
+                  </button>
+                </div>
+
+                <p className="ai-safety-note">
+                  Commands are limited to predefined language-specific tasks.
+                  Review each suggestion and confirm before it runs.
                 </p>
+
+                {aiSuggestion && (
+                  <div className="ai-suggestion">
+                    <strong>Suggestion</strong>
+                    <p>{aiSuggestion.explanation}</p>
+                    {aiSuggestion.command ? (
+                      <>
+                        <code>{aiSuggestion.command}</code>
+                        <button
+                          className="primary-button"
+                          onClick={runSuggestedCommand}
+                          disabled={aiBusy !== null}
+                        >
+                          {aiBusy === "running" ? (
+                            <LoaderCircle size={16} className="spin" />
+                          ) : (
+                            <Play size={16} />
+                          )}
+                          Run this command
+                        </button>
+                      </>
+                    ) : (
+                      <p>No supported command was suggested for this request.</p>
+                    )}
+                  </div>
+                )}
+
+                {aiExecution && (
+                  <div className={`ai-output ${aiExecution.success ? "success" : "failure"}`}>
+                    <strong>
+                      {aiExecution.success ? "Command completed" : "Command failed"}:{" "}
+                      {aiExecution.command}
+                    </strong>
+                    <pre>{aiExecution.output}</pre>
+                  </div>
+                )}
+
+                {aiError && <p className="ai-error" role="alert">{aiError}</p>}
               </div>
             </section>
           )}

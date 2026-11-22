@@ -14,9 +14,10 @@ It provides a unified environment where developers can create microservices usin
 - **Microservice management:** Create and manage microservices from a central dashboard with UI.
 - **Multiple languages:** Planned support for Node.js, Python, Go, and Rust.
 - **Automatic workspace creation:** Micronom creates an `app` directory in the user's home directory when the first service is created.
+- **Persistent workspace:** Services and connections are restored when the app is reopened.
 - **Independent projects:** Each microservice gets its own directory.
 - **Docker integration:** Planned support for building and running services in Docker containers.
-- **AI development assistant:** Planned integration with local and cloud AI providers, including Ollama.
+- **AI command assistant:** Uses a local Ollama model to recommend a limited development command for the selected service. Commands are shown for review and require confirmation before running.
 
 ## Technology Stack
 
@@ -150,4 +151,18 @@ Build the frontend:
 npm run build
 ```
 
-Build
+## Local AI command assistant
+
+The command assistant uses [Ollama](https://ollama.com/) locally; prompts are sent to the Ollama service on your computer, not to a hosted AI provider.
+
+1. Install and start Ollama.
+2. Download the default model:
+
+   ```powershell
+   ollama pull qwen2.5-coder:7b
+   ```
+
+3. Run Micronom as a desktop app, select a microservice, enter a request in **AI command assistant**, and choose **Ask AI**.
+4. Review the suggested command and choose **Run this command** to execute it in that service's directory.
+
+The assistant only supports predefined commands for the service language. It does not run arbitrary model-generated shell text. Command execution is limited to 120 seconds and captured output is capped.

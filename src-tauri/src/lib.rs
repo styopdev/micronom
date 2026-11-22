@@ -1,7 +1,13 @@
 
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
 
 fn write_file(
     service_dir: &Path,
@@ -29,6 +35,418 @@ fn find_available_port() -> Result<u16, String> {
 
     drop(listener);
     Ok(port)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingService {
+    name: String,
+    language: String,
+    framework: String,
+}
+
+#[tauri::command]
+fn list_service_folders() -> Result<Vec<ExistingService>, String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+    let app_dir = PathBuf::from(home).join("app");
+
+    if !app_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = std::fs::read_dir(&app_dir)
+        .map_err(|error| format!("Could not read the Micronom app directory: {error}"))?;
+    let mut services = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not read a service entry: {error}"))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect a service entry: {error}"))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty()
+            || !name.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'
+            })
+        {
+            continue;
+        }
+
+        let directory = entry.path();
+        let metadata = if directory.join("package.json").is_file() {
+            Some(("Node.js", "Express"))
+        } else if directory.join("requirements.txt").is_file() {
+            Some(("Python", "FastAPI"))
+        } else if directory.join("go.mod").is_file() {
+            Some(("Go", "Gin"))
+        } else if directory.join("Cargo.toml").is_file() {
+            Some(("Rust", "Axum"))
+        } else {
+            None
+        };
+
+        if let Some((language, framework)) = metadata {
+            services.push(ExistingService {
+                name,
+                language: language.into(),
+                framework: framework.into(),
+            });
+        }
+    }
+
+    services.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(services)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandSuggestion {
+    command_id: Option<String>,
+    command: Option<String>,
+    explanation: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaResponse {
+    message: OllamaMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaMessage {
+    content: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelSuggestion {
+    command_id: Option<String>,
+    explanation: String,
+}
+
+fn command_for_id(
+    command_id: &str,
+) -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    match command_id {
+        "node-install" => Some(("npm", &["install"], "npm install")),
+        "python-install" => Some((
+            "python",
+            &["-m", "pip", "install", "-r", "requirements.txt"],
+            "python -m pip install -r requirements.txt",
+        )),
+        "python-check" => Some((
+            "python",
+            &["-m", "compileall", "app"],
+            "python -m compileall app",
+        )),
+        "go-download" => Some(("go", &["mod", "download"], "go mod download")),
+        "go-test" => Some(("go", &["test", "./..."], "go test ./...")),
+        "rust-check" => Some(("cargo", &["check"], "cargo check")),
+        "rust-test" => Some(("cargo", &["test"], "cargo test")),
+        _ => None,
+    }
+}
+
+fn allowed_command_ids(language: &str) -> Option<&'static [&'static str]> {
+    match language {
+        "Node.js" => Some(&["node-install"]),
+        "Python" => Some(&["python-install", "python-check"]),
+        "Go" => Some(&["go-download", "go-test"]),
+        "Rust" => Some(&["rust-check", "rust-test"]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::{allowed_command_ids, command_for_id};
+
+    #[test]
+    fn command_allowlist_is_scoped_to_service_language() {
+        assert!(allowed_command_ids("Go").unwrap().contains(&"go-test"));
+        assert!(!allowed_command_ids("Go").unwrap().contains(&"rust-test"));
+    }
+
+    #[test]
+    fn unknown_command_ids_are_rejected() {
+        assert!(command_for_id("powershell").is_none());
+    }
+}
+
+#[tauri::command]
+async fn suggest_service_command(
+    model: String,
+    prompt: String,
+    language: String,
+    framework: String,
+) -> Result<CommandSuggestion, String> {
+    if model.is_empty()
+        || model.len() > 100
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
+    {
+        return Err("Enter a valid Ollama model name.".into());
+    }
+
+    if prompt.trim().is_empty() || prompt.len() > 4000 {
+        return Err("Enter a request of up to 4,000 characters.".into());
+    }
+
+    let allowed_ids = allowed_command_ids(&language)
+        .ok_or_else(|| "Unsupported service language.".to_string())?;
+    let command_options = allowed_ids
+        .iter()
+        .filter_map(|id| command_for_id(id).map(|(_, _, command)| format!("- {id}: {command}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let request = serde_json::json!({
+        "model": model,
+        "stream": false,
+        "format": "json",
+        "messages": [
+            {
+                "role": "system",
+                "content": format!(
+                    "You are Micronom's local development assistant. Choose at most one command from this exact allowlist:\n{command_options}\n\
+                    Return JSON with keys commandId and explanation. commandId must be one listed ID or null if none applies. \
+                    Never invent or suggest shell commands, command arguments, code, or destructive actions. \
+                    The selected command will be displayed to the user for confirmation before it runs."
+                )
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Service language: {language} ({framework}). Request: {}",
+                    prompt.trim()
+                )
+            }
+        ]
+    });
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| format!("Could not create the Ollama client: {error}"))?
+        .post("http://127.0.0.1:11434/api/chat")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            format!("Could not reach Ollama at 127.0.0.1:11434. Ensure Ollama is running: {error}")
+        })?
+        .error_for_status()
+        .map_err(|error| format!("Ollama returned an error: {error}"))?
+        .json::<OllamaResponse>()
+        .await
+        .map_err(|error| format!("Could not read the Ollama response: {error}"))?;
+
+    let suggestion = serde_json::from_str::<ModelSuggestion>(&response.message.content)
+        .map_err(|error| format!("Ollama returned an invalid command suggestion: {error}"))?;
+
+    if suggestion
+        .command_id
+        .as_deref()
+        .is_some_and(|id| !allowed_ids.contains(&id))
+    {
+        return Err("Ollama suggested a command outside the supported allowlist.".into());
+    }
+
+    let command_id = suggestion.command_id;
+    let command = command_id
+        .as_deref()
+        .and_then(command_for_id)
+        .map(|(_, _, command)| command.to_string());
+
+    Ok(CommandSuggestion {
+        command_id,
+        command,
+        explanation: suggestion.explanation,
+    })
+}
+
+fn capture_output<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut buffer = [0; 4096];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let remaining = MAX_COMMAND_OUTPUT.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..count.min(remaining)]);
+                }
+            }
+        }
+
+        captured
+    })
+}
+
+fn execute_fixed_command(
+    program: &str,
+    args: &[&str],
+    service_dir: &Path,
+) -> Result<(bool, String), String> {
+    let mut command = if cfg!(windows) && program == "npm" {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/D", "/S", "/C", "npm install"]);
+        cmd
+    } else {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd
+    };
+
+    let mut child = command
+        .current_dir(service_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not start {program}: {error}"))?;
+
+    let stdout = capture_output(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| "Could not capture command output.".to_string())?,
+    );
+    let stderr = capture_output(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| "Could not capture command errors.".to_string())?,
+    );
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(format!("Could not monitor {program}: {error}"));
+            }
+        }
+
+        if started.elapsed() >= COMMAND_TIMEOUT {
+            child
+                .kill()
+                .map_err(|error| format!("Could not stop timed-out {program}: {error}"))?;
+            let _ = child.wait();
+            let _ = stdout.join();
+            let _ = stderr.join();
+            return Err(format!("{program} exceeded the 120-second command limit."));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut output = stdout
+        .join()
+        .map_err(|_| "Could not collect command output.".to_string())?;
+    let error_output = stderr
+        .join()
+        .map_err(|_| "Could not collect command output.".to_string())?;
+    output.extend_from_slice(&error_output);
+    let text = String::from_utf8_lossy(&output).trim().to_string();
+
+    Ok((
+        status.success(),
+        if text.is_empty() {
+            if status.success() {
+                "Command completed successfully.".into()
+            } else {
+                "Command failed without additional output.".into()
+            }
+        } else {
+            text
+        },
+    ))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandExecution {
+    command: String,
+    success: bool,
+    output: String,
+}
+
+#[tauri::command]
+async fn execute_service_command(
+    service_name: String,
+    command_id: String,
+    language: String,
+) -> Result<CommandExecution, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        execute_service_command_blocking(service_name, command_id, language)
+    })
+    .await
+    .map_err(|error| format!("Command task failed: {error}"))?
+}
+
+fn execute_service_command_blocking(
+    service_name: String,
+    command_id: String,
+    language: String,
+) -> Result<CommandExecution, String> {
+    if service_name.is_empty()
+        || !service_name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("Invalid microservice name.".into());
+    }
+
+    let allowed_ids = allowed_command_ids(&language)
+        .ok_or_else(|| "Unsupported service language.".to_string())?;
+    if !allowed_ids.contains(&command_id.as_str()) {
+        return Err("This command is not allowed for the selected service language.".into());
+    }
+
+    let (program, args, display_command) =
+        command_for_id(&command_id).ok_or_else(|| "This command is not allowed.".to_string())?;
+
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+    let app_dir = PathBuf::from(home).join("app");
+    let canonical_app = app_dir
+        .canonicalize()
+        .map_err(|error| format!("Could not access the Micronom app directory: {error}"))?;
+    let service_dir = canonical_app.join(&service_name);
+    let canonical_service = service_dir
+        .canonicalize()
+        .map_err(|error| format!("Could not access the microservice directory: {error}"))?;
+
+    if canonical_service.parent() != Some(canonical_app.as_path()) || !canonical_service.is_dir() {
+        return Err(
+            "The microservice must be a direct child of the Micronom app directory.".into(),
+        );
+    }
+
+    let (success, output) = execute_fixed_command(program, args, &canonical_service)?;
+
+    Ok(CommandExecution {
+        command: display_command.into(),
+        success,
+        output,
+    })
 }
 
 #[tauri::command]
@@ -442,6 +860,9 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             create_service_folder,
+            list_service_folders,
+            suggest_service_command,
+            execute_service_command,
             remove_service_folder,
             run_all_services,
             stop_all_services
