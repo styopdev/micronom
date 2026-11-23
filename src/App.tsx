@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import tzukGnome from "./assets/tzuk-gnome.png";
 import {
   Activity,
   Boxes,
@@ -26,7 +27,6 @@ import {
   ArrowRight,
   MessageSquare,
   Trash2,
-  Sparkles,
   Send,
 } from "lucide-react";
 import "./App.css";
@@ -947,11 +947,11 @@ function App() {
               <div className="ai-panel">
                 <div className="ai-panel-heading">
                   <div className="ai-panel-icon">
-                    <Sparkles size={19} />
+                    <img src={tzukGnome} alt="" />
                   </div>
                   <div>
-                    <h3>AI command assistant</h3>
-                    <p>Ask local Ollama to recommend a development command.</p>
+                    <h3>Tzuk</h3>
+                    <p>Local development assistant powered by Ollama.</p>
                   </div>
                 </div>
 
@@ -1001,9 +1001,16 @@ function App() {
                     ) : (
                       <Send size={16} />
                     )}
-                    Ask AI
+                    {aiBusy === "suggesting" ? "Asking Ollama..." : "Ask AI"}
                   </button>
                 </div>
+
+                {aiBusy === "suggesting" && (
+                  <p className="ai-status" role="status" aria-live="polite">
+                    Waiting for local Ollama. The first response may take a little
+                    longer.
+                  </p>
+                )}
 
                 <p className="ai-safety-note">
                   Commands are limited to predefined language-specific tasks.
@@ -1012,7 +1019,9 @@ function App() {
 
                 {aiSuggestion && (
                   <div className="ai-suggestion">
-                    <strong>Suggestion</strong>
+                    <strong>
+                      {aiSuggestion.command ? "Suggestion" : "No command to run"}
+                    </strong>
                     <p>{aiSuggestion.explanation}</p>
                     {aiSuggestion.command ? (
                       <>
@@ -1031,7 +1040,10 @@ function App() {
                         </button>
                       </>
                     ) : (
-                      <p>No supported command was suggested for this request.</p>
+                      <p>
+                        This assistant only recommends predefined development
+                        commands. Try a request such as “Install dependencies.”
+                      </p>
                     )}
                   </div>
                 )}
