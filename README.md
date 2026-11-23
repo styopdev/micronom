@@ -5,7 +5,7 @@
 Micronom is an AI-powered UI based framework for creating, managing, and orchestrating microservices from a single workspace.
 
 It provides a unified environment where developers can create microservices using different programming languages and frameworks, manage their projects, and eventually use AI to generate and modify service code.
-<img width="233" alt="Capture6" src="https://github.com/user-attachments/assets/1af3f63a-fe58-4cd5-afb6-485935751b86" />
+<img width="800" alt="Capture6" src="https://github.com/user-attachments/assets/1af3f63a-fe58-4cd5-afb6-485935751b86" />
 
 ---
 
