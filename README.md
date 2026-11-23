@@ -19,8 +19,8 @@ It provides a unified environment where developers can create microservices usin
 - **Independent projects:** Each microservice gets its own directory.
 - **Docker integration:** Planned support for building and running services in Docker containers.
 - **AI command assistant:** Uses a local Ollama model to recommend a limited development command for the selected service. Commands are shown for review and require confirmation before running.
-<img width="300" alt="Capture2" src="https://github.com/user-attachments/assets/fc3705ad-bf63-4070-bab9-74de091464bc" />
-<img width="300" alt="Capture7" src="https://github.com/user-attachments/assets/2abde1fb-abaa-4019-ad84-72cc5164f7d4" />
+<img width="500" alt="Capture2" src="https://github.com/user-attachments/assets/fc3705ad-bf63-4070-bab9-74de091464bc" />
+<img width="500" alt="Capture7" src="https://github.com/user-attachments/assets/2abde1fb-abaa-4019-ad84-72cc5164f7d4" />
 
 ## Technology Stack
 
