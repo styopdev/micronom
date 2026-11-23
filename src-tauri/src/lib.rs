@@ -39,12 +39,218 @@ fn find_available_port() -> Result<u16, String> {
     Ok(port)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DatabaseType {
+    Mongo,
+    Postgres,
+    Redis,
+    Faiss,
+}
+
+impl DatabaseType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mongo => "MongoDB",
+            Self::Postgres => "PostgreSQL",
+            Self::Redis => "Redis",
+            Self::Faiss => "FAISS",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mongo => "mongo",
+            Self::Postgres => "postgres",
+            Self::Redis => "redis",
+            Self::Faiss => "faiss",
+        }
+    }
+}
+
+fn generate_database_password() -> Result<String, String> {
+    let mut random_bytes = [0u8; 32];
+    getrandom::fill(&mut random_bytes)
+        .map_err(|error| format!("Could not generate database credentials: {error}"))?;
+
+    Ok(random_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn database_env_entries(
+    service_name: &str,
+    database_type: DatabaseType,
+    password: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let mut entries = vec![(
+        "DATABASE_TYPE",
+        database_type.as_str().to_string(),
+    )];
+
+    match database_type {
+        DatabaseType::Mongo => {
+            let password = password
+                .ok_or_else(|| "MongoDB password was not generated.".to_string())?;
+            entries.extend([
+                ("MONGO_USER", "micronom".into()),
+                ("MONGO_PASSWORD", password.into()),
+                (
+                    "DATABASE_URL",
+                    format!(
+                        "mongodb://micronom:{password}@db-{service_name}:27017/{service_name}?authSource=admin"
+                    ),
+                ),
+            ]);
+        }
+        DatabaseType::Postgres => {
+            let password = password
+                .ok_or_else(|| "PostgreSQL password was not generated.".to_string())?;
+            entries.extend([
+                ("POSTGRES_PASSWORD", password.into()),
+                (
+                    "DATABASE_URL",
+                    format!(
+                        "postgresql://micronom:{password}@db-{service_name}:5432/{service_name}"
+                    ),
+                ),
+            ]);
+        }
+        DatabaseType::Redis => {
+            let password = password
+                .ok_or_else(|| "Redis password was not generated.".to_string())?;
+            entries.extend([
+                ("REDIS_PASSWORD", password.into()),
+                (
+                    "DATABASE_URL",
+                    format!("redis://:{password}@db-{service_name}:6379/0"),
+                ),
+            ]);
+        }
+        DatabaseType::Faiss => {
+            entries.push(("FAISS_INDEX_PATH", "/data/faiss".into()));
+        }
+    }
+
+    Ok(entries)
+}
+
+fn generate_database_compose(service_name: &str, database_type: DatabaseType) -> String {
+    let database_service_name = format!("db-{service_name}");
+    match database_type {
+        DatabaseType::Mongo => format!(
+            r#"services:
+  {service_name}:
+    environment:
+      DATABASE_TYPE: mongo
+      DATABASE_URL: "${{DATABASE_URL}}"
+    depends_on:
+      {database_service_name}:
+        condition: service_healthy
+  {database_service_name}:
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${{MONGO_USER}}"
+      MONGO_INITDB_ROOT_PASSWORD: "${{MONGO_PASSWORD}}"
+      MONGO_INITDB_DATABASE: "{service_name}"
+    volumes:
+      - mongo-data:/data/db
+      - ./.micronom/mongo-init.js:/docker-entrypoint-initdb.d/01-micronom-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  mongo-data: {{}}
+"#
+        ),
+        DatabaseType::Postgres => format!(
+            r#"services:
+  {service_name}:
+    environment:
+      DATABASE_TYPE: postgres
+      DATABASE_URL: "${{DATABASE_URL}}"
+    depends_on:
+      {database_service_name}:
+        condition: service_healthy
+  {database_service_name}:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: "{service_name}"
+      POSTGRES_USER: micronom
+      POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD}}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U micronom -d {service_name}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  postgres-data: {{}}
+"#
+        ),
+        DatabaseType::Redis => format!(
+            r#"services:
+  {service_name}:
+    environment:
+      DATABASE_TYPE: redis
+      DATABASE_URL: "${{DATABASE_URL}}"
+    depends_on:
+      {database_service_name}:
+        condition: service_healthy
+  {database_service_name}:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: "${{REDIS_PASSWORD}}"
+      REDISCLI_AUTH: "${{REDIS_PASSWORD}}"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${{REDIS_PASSWORD}}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  redis-data: {{}}
+"#
+        ),
+        DatabaseType::Faiss => format!(
+            r#"services:
+  {service_name}:
+    environment:
+      DATABASE_TYPE: faiss
+      FAISS_INDEX_PATH: /data/faiss
+    volumes:
+      - faiss-index:/data/faiss
+volumes:
+  faiss-index: {{}}
+"#
+        ),
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExistingService {
     name: String,
     language: String,
     framework: String,
+    database: Option<DatabaseType>,
+}
+
+fn read_database_type(directory: &Path) -> Result<Option<DatabaseType>, String> {
+    let path = directory.join(".micronom").join("database.json");
+    match std::fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|error| format!("Could not read service database configuration: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read service database configuration: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -101,6 +307,7 @@ fn list_service_folders() -> Result<Vec<ExistingService>, String> {
                 name,
                 language: language.into(),
                 framework: framework.into(),
+                database: read_database_type(&directory)?,
             });
         }
     }
@@ -169,7 +376,10 @@ fn allowed_command_ids(language: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(test)]
 mod command_tests {
-    use super::{allowed_command_ids, command_for_id};
+    use super::{
+        allowed_command_ids, command_for_id, database_env_entries, generate_database_compose,
+        DatabaseType,
+    };
 
     #[test]
     fn command_allowlist_is_scoped_to_service_language() {
@@ -180,6 +390,56 @@ mod command_tests {
     #[test]
     fn unknown_command_ids_are_rejected() {
         assert!(command_for_id("powershell").is_none());
+    }
+
+    #[test]
+    fn postgres_configuration_has_a_persistent_healthy_service() {
+        let compose = generate_database_compose("catalog", DatabaseType::Postgres);
+        let environment =
+            database_env_entries("catalog", DatabaseType::Postgres, Some("secret")).unwrap();
+
+        assert!(compose.contains("image: postgres:17-alpine"));
+        assert!(compose.contains("postgres-data:/var/lib/postgresql/data"));
+        assert!(compose.contains("condition: service_healthy"));
+        assert!(environment.iter().any(|(key, value)| {
+            *key == "DATABASE_URL"
+                && value == "postgresql://micronom:secret@db-catalog:5432/catalog"
+        }));
+    }
+
+    #[test]
+    fn mongo_and_redis_store_passwords_outside_compose_files() {
+        let mongo_compose = generate_database_compose("catalog", DatabaseType::Mongo);
+        let redis_compose = generate_database_compose("catalog", DatabaseType::Redis);
+        let mongo_environment =
+            database_env_entries("catalog", DatabaseType::Mongo, Some("secret")).unwrap();
+        let redis_environment =
+            database_env_entries("catalog", DatabaseType::Redis, Some("secret")).unwrap();
+
+        assert!(mongo_compose.contains("mongo-data:/data/db"));
+        assert!(mongo_compose.contains("mongo-init.js:/docker-entrypoint-initdb.d"));
+        assert!(redis_compose.contains("redis-data:/data"));
+        assert!(!mongo_compose.contains("secret"));
+        assert!(!redis_compose.contains("secret"));
+        assert!(mongo_environment.iter().any(|(key, value)| {
+            *key == "DATABASE_URL"
+                && value == "mongodb://micronom:secret@db-catalog:27017/catalog?authSource=admin"
+        }));
+        assert!(redis_environment.iter().any(|(key, value)| {
+            *key == "DATABASE_URL" && value == "redis://:secret@db-catalog:6379/0"
+        }));
+    }
+
+    #[test]
+    fn faiss_uses_a_persistent_python_index_volume() {
+        let compose = generate_database_compose("catalog", DatabaseType::Faiss);
+        let environment = database_env_entries("catalog", DatabaseType::Faiss, None).unwrap();
+
+        assert!(compose.contains("FAISS_INDEX_PATH: /data/faiss"));
+        assert!(compose.contains("faiss-index:/data/faiss"));
+        assert!(environment.iter().any(|(key, value)| {
+            *key == "FAISS_INDEX_PATH" && value == "/data/faiss"
+        }));
     }
 }
 
@@ -790,6 +1050,8 @@ target/
             ".dockerignore",
             r#".git
 .env
+.micronom
+.micronom
 node_modules
 .venv
 __pycache__
@@ -862,6 +1124,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             create_service_folder,
+            configure_service_database,
             list_service_folders,
             suggest_service_command,
             execute_service_command,
@@ -925,6 +1188,218 @@ fn remove_service_folder(name: String) -> Result<(), String> {
         .map_err(|error| format!("Failed to delete microservice: {}", error))?;
 
     Ok(())
+}
+
+fn write_database_environment(
+    service_dir: &Path,
+    entries: &[(&str, String)],
+) -> Result<(), String> {
+    let path = service_dir.join(".env");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("Could not read service environment: {error}")),
+    };
+
+    let database_keys = [
+        "DATABASE_TYPE",
+        "DATABASE_URL",
+        "MONGO_USER",
+        "MONGO_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "REDIS_PASSWORD",
+        "FAISS_INDEX_PATH",
+    ];
+    let mut lines = existing
+        .lines()
+        .filter(|line| {
+            let key = line.split_once('=').map(|(key, _)| key.trim());
+            !key.is_some_and(|key| database_keys.contains(&key))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    lines.extend(
+        entries
+            .iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    write_file(service_dir, ".env", &format!("{}\n", lines.join("\n")))
+}
+
+fn add_faiss_dependency(service_dir: &Path) -> Result<(), String> {
+    let requirements_path = service_dir.join("requirements.txt");
+    let mut requirements = std::fs::read_to_string(&requirements_path)
+        .map_err(|error| format!("Could not read Python requirements: {error}"))?;
+
+    if !requirements
+        .lines()
+        .any(|line| line.trim().to_ascii_lowercase().starts_with("faiss-cpu"))
+    {
+        if !requirements.is_empty() && !requirements.ends_with('\n') {
+            requirements.push('\n');
+        }
+        requirements.push_str("faiss-cpu>=1.8,<2\n");
+        write_file(service_dir, "requirements.txt", &requirements)?;
+    }
+
+    Ok(())
+}
+
+fn prepare_faiss_runtime(service_dir: &Path) -> Result<(), String> {
+    add_faiss_dependency(service_dir)?;
+
+    let dockerfile = std::fs::read_to_string(service_dir.join("Dockerfile"))
+        .map_err(|error| format!("Could not read the Python Dockerfile: {error}"))?;
+    if dockerfile.contains("libgomp1") {
+        return Ok(());
+    }
+
+    let mut updated_lines = Vec::new();
+    let mut added_runtime_library = false;
+    for line in dockerfile.lines() {
+        updated_lines.push(line.to_string());
+        if line.trim() == "FROM python:3.12-slim" {
+            updated_lines.push(
+                "RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*"
+                    .into(),
+            );
+            added_runtime_library = true;
+        }
+    }
+
+    if !added_runtime_library {
+        return Err("Could not configure FAISS in the Python Dockerfile.".into());
+    }
+
+    write_file(
+        service_dir,
+        "Dockerfile",
+        &format!("{}\n", updated_lines.join("\n")),
+    )
+}
+
+fn append_database_documentation(
+    service_dir: &Path,
+    database_type: DatabaseType,
+) -> Result<(), String> {
+    let path = service_dir.join("README.md");
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read the service README: {error}"))?;
+    if existing.lines().any(|line| line.trim() == "## Database") {
+        return Ok(());
+    }
+    let database_details = match database_type {
+        DatabaseType::Faiss => {
+            "FAISS is embedded in the Python service. The `faiss-cpu` package and `FAISS_INDEX_PATH` are configured, and the index directory is persisted in a Docker volume. Add indexing and search logic in the application to use it.".to_string()
+        }
+        _ => format!(
+            "{} runs as a companion container. The service receives its connection string in `DATABASE_URL`; add a client driver and connection logic in the application to use it.",
+            database_type.label()
+        ),
+    };
+    let section = format!(
+        "\n## Database\n\n{database_details}\n\nCredentials are stored in `.env`, which is ignored by Git. Run all starts the service and its database; shutting down keeps the named database volume.\n"
+    );
+
+    write_file(service_dir, "README.md", &format!("{existing}{section}"))
+}
+
+fn exclude_database_metadata_from_build_context(service_dir: &Path) -> Result<(), String> {
+    let path = service_dir.join(".dockerignore");
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read the Docker ignore file: {error}"))?;
+    if existing.lines().any(|line| line.trim() == ".micronom") {
+        return Ok(());
+    }
+
+    write_file(
+        service_dir,
+        ".dockerignore",
+        &format!("{}.micronom\n", existing.trim_end()),
+    )
+}
+
+fn prepare_mongo_database(service_dir: &Path, service_name: &str) -> Result<(), String> {
+    let init_script = format!(
+        "db = db.getSiblingDB(\"{service_name}\");\ndb.createCollection(\"_micronom_init\");\n"
+    );
+    write_file(service_dir, ".micronom/mongo-init.js", &init_script)
+}
+
+#[tauri::command]
+fn configure_service_database(
+    service_name: String,
+    database_type: DatabaseType,
+) -> Result<DatabaseType, String> {
+    if service_name.is_empty()
+        || service_name.len() > 48
+        || !service_name.as_bytes()[0].is_ascii_alphanumeric()
+        || !service_name.as_bytes()[service_name.len() - 1].is_ascii_alphanumeric()
+        || !service_name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        return Err("Invalid microservice name.".into());
+    }
+
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+    let app_dir = PathBuf::from(home).join("app");
+    let canonical_app = app_dir
+        .canonicalize()
+        .map_err(|error| format!("Could not access the Micronom app directory: {error}"))?;
+    let canonical_service = app_dir
+        .join(&service_name)
+        .canonicalize()
+        .map_err(|error| format!("Could not access the microservice directory: {error}"))?;
+
+    if canonical_service.parent() != Some(canonical_app.as_path()) || !canonical_service.is_dir()
+    {
+        return Err("Invalid microservice directory.".into());
+    }
+    if !canonical_service.join("docker-compose.yml").is_file() {
+        return Err("The microservice does not have a Docker Compose file.".into());
+    }
+    if database_type == DatabaseType::Faiss
+        && !canonical_service.join("requirements.txt").is_file()
+    {
+        return Err("FAISS is currently supported only for Python services.".into());
+    }
+    if read_database_type(&canonical_service)?.is_some() {
+        return Err("This microservice already has a database configured.".into());
+    }
+
+    let password = if database_type == DatabaseType::Faiss {
+        None
+    } else {
+        Some(generate_database_password()?)
+    };
+    let environment =
+        database_env_entries(&service_name, database_type, password.as_deref())?;
+    let compose = generate_database_compose(&service_name, database_type);
+
+    match database_type {
+        DatabaseType::Mongo => prepare_mongo_database(&canonical_service, &service_name)?,
+        DatabaseType::Faiss => prepare_faiss_runtime(&canonical_service)?,
+        DatabaseType::Postgres | DatabaseType::Redis => {}
+    }
+
+    write_database_environment(&canonical_service, &environment)?;
+    exclude_database_metadata_from_build_context(&canonical_service)?;
+    write_file(&canonical_service, "docker-compose.db.yml", &compose)?;
+    append_database_documentation(&canonical_service, database_type)?;
+
+    let metadata = serde_json::to_string(&database_type)
+        .map_err(|error| format!("Could not save database configuration: {error}"))?;
+    write_file(
+        &canonical_service,
+        ".micronom/database.json",
+        &format!("{metadata}\n"),
+    )?;
+
+    Ok(database_type)
 }
 
 
@@ -996,19 +1471,23 @@ fn run_compose(
     );
 
     let mut command = Command::new("docker");
+    command.arg("compose");
+    if service_dir.join("docker-compose.db.yml").is_file() {
+        command.args(["-f", "docker-compose.yml", "-f", "docker-compose.db.yml"]);
+    } else {
+        command.args(["-f", "docker-compose.yml"]);
+    }
+
     if action == "up" {
         command.args([
-            "compose",
             "--progress",
             "plain",
-            "-f",
-            "docker-compose.yml",
             "up",
             "--build",
             "-d",
         ]);
     } else {
-        command.args(["compose", "-f", "docker-compose.yml", "down"]);
+        command.arg("down");
     }
 
     let mut child = command

@@ -37,7 +37,37 @@ type Service = {
   language: string;
   framework: string;
   status: "Created";
+  database?: DatabaseType | null;
 };
+
+type DatabaseType = "mongo" | "postgres" | "redis" | "faiss";
+
+const databaseOptions: {
+  id: DatabaseType;
+  name: string;
+  description: string;
+}[] = [
+  {
+    id: "mongo",
+    name: "MongoDB",
+    description: "Document database, configured in a separate container.",
+  },
+  {
+    id: "postgres",
+    name: "PostgreSQL",
+    description: "Relational database with persistent storage.",
+  },
+  {
+    id: "redis",
+    name: "Redis",
+    description: "In-memory data store with persistent volume.",
+  },
+  {
+    id: "faiss",
+    name: "FAISS",
+    description: "Embedded vector index for Python services.",
+  },
+];
 
 type ConnectionMethod = "Messaging" | "REST API" | "gRPC" | "Webhooks";
 
@@ -135,6 +165,10 @@ function isSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value);
 }
 
+function isDatabaseType(value: unknown): value is DatabaseType {
+  return databaseOptions.some((database) => database.id === value);
+}
+
 function isService(value: unknown): value is Service {
   return (
     isRecord(value) &&
@@ -142,7 +176,10 @@ function isService(value: unknown): value is Service {
     typeof value.name === "string" &&
     typeof value.language === "string" &&
     typeof value.framework === "string" &&
-    value.status === "Created"
+    value.status === "Created" &&
+    (value.database === undefined ||
+      value.database === null ||
+      isDatabaseType(value.database))
   );
 }
 
@@ -264,9 +301,14 @@ function App() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [connectionModalOpen, setConnectionModalOpen] = useState(false);
+  const [databaseModalOpen, setDatabaseModalOpen] = useState(false);
 
   const [serviceName, setServiceName] = useState("");
   const [language, setLanguage] = useState("Node.js");
+  const [databaseSelection, setDatabaseSelection] =
+    useState<DatabaseType>("postgres");
+  const [databaseError, setDatabaseError] = useState("");
+  const [databaseBusy, setDatabaseBusy] = useState(false);
   const [activeService, setActiveService] = useState<number | null>(
     savedWorkspace.workspace.activeServiceId
   );
@@ -333,7 +375,12 @@ function App() {
     if (savedWorkspace.hasSavedWorkspace || !isTauri()) return;
 
     let cancelled = false;
-    invoke<{ name: string; language: string; framework: string }[]>(
+    invoke<{
+      name: string;
+      language: string;
+      framework: string;
+      database: DatabaseType | null;
+    }[]>(
       "list_service_folders"
     )
       .then((existingServices) => {
@@ -344,6 +391,7 @@ function App() {
             ...service,
             id: index + 1,
             status: "Created",
+            database: service.database,
           })
         );
         setServices(restoredServices);
@@ -417,6 +465,34 @@ function App() {
     }
   }
 
+  async function configureServiceDatabase() {
+    if (!selectedService) return;
+    const serviceId = selectedService.id;
+
+    setDatabaseBusy(true);
+    setDatabaseError("");
+
+    try {
+      const database = await invoke<DatabaseType>(
+        "configure_service_database",
+        {
+          serviceName: selectedService.name,
+          databaseType: databaseSelection,
+        }
+      );
+      const nextServices = services.map((service) =>
+        service.id === serviceId ? { ...service, database } : service
+      );
+      setServices(nextServices);
+      persistWorkspaceState(nextServices, connections, activeService);
+      setDatabaseModalOpen(false);
+    } catch (error) {
+      setDatabaseError(`Could not configure database: ${String(error)}`);
+    } finally {
+      setDatabaseBusy(false);
+    }
+  }
+
   async function handleBulkAction(action: "run" | "stop") {
     setBulkLoading(true);
     setBulkProgress([]);
@@ -482,6 +558,7 @@ function App() {
         language,
         framework: selectedLanguage.framework,
         status: "Created",
+        database: null,
       };
 
       const nextServices = [...services, service];
@@ -767,14 +844,6 @@ function App() {
                   <Search size={15} />
                   <span>Search services</span>
                 </div>
-                <button
-                  className="secondary-button"
-                  onClick={() => setModalOpen(true)}
-                  disabled={!workspaceHydrated}
-                >
-                  <Plus size={16} />
-                  New service
-                </button>
               </div>
             </div>
 
@@ -941,6 +1010,59 @@ function App() {
                       );
                     })}
                   </div>
+                )}
+              </div>
+
+              <div className="database-panel">
+                <div className="database-panel-heading">
+                  <div>
+                    <h3>Database</h3>
+                    <p>
+                      Provision one persistent database for this microservice.
+                    </p>
+                  </div>
+                  {!selectedService.database && (
+                    <button
+                      className="primary-button"
+                      onClick={() => {
+                        setDatabaseSelection("postgres");
+                        setDatabaseError("");
+                        setDatabaseModalOpen(true);
+                      }}
+                    >
+                      <Plus size={17} />
+                      Connect database
+                    </button>
+                  )}
+                </div>
+
+                {selectedService.database ? (
+                  <div className="database-configured">
+                    <Database size={18} />
+                    <div>
+                      <strong>
+                        {
+                          databaseOptions.find(
+                            (database) =>
+                              database.id === selectedService.database
+                          )?.name
+                        }{" "}
+                        configured
+                      </strong>
+                      <p>
+                        {selectedService.database === "faiss"
+                          ? "A FAISS index volume will be mounted in this Python service."
+                          : "A persistent database container and connection URL are configured."}{" "}
+                        Click Run all to start the service with its database.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="database-empty">
+                    Select MongoDB, PostgreSQL, Redis, or FAISS for Python
+                    services. Credentials are stored in the service’s ignored
+                    .env file.
+                  </p>
                 )}
               </div>
 
@@ -1284,6 +1406,112 @@ function App() {
               >
                 <Network size={17} />
                 Create connection
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {databaseModalOpen && selectedService && (
+        <div
+          className="modal-overlay"
+          onClick={() => setDatabaseModalOpen(false)}
+        >
+          <div
+            className="modal database-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <div className="eyebrow">DATABASE SETUP</div>
+                <h2>Connect a database</h2>
+                <p>Choose one database for {selectedService.name}.</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setDatabaseModalOpen(false)}
+                title="Close database setup"
+              >
+                <X size={19} />
+              </button>
+            </div>
+
+            <div className="database-option-list">
+              {databaseOptions.map((database) => {
+                const unavailable =
+                  database.id === "faiss" &&
+                  selectedService.language !== "Python";
+
+                return (
+                  <button
+                    key={database.id}
+                    className={`database-option ${
+                      databaseSelection === database.id ? "selected" : ""
+                    }`}
+                    onClick={() => {
+                      setDatabaseSelection(database.id);
+                      setDatabaseError("");
+                    }}
+                    disabled={unavailable || databaseBusy}
+                    title={
+                      unavailable
+                        ? "FAISS is currently supported only for Python services"
+                        : undefined
+                    }
+                  >
+                    <Database size={20} />
+                    <span>
+                      <strong>{database.name}</strong>
+                      <small>
+                        {unavailable
+                          ? "Currently available for Python services only."
+                          : database.description}
+                      </small>
+                    </span>
+                    <span className="language-radio">
+                      {databaseSelection === database.id ? "✓" : ""}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="connection-note">
+              <Database size={16} />
+              <span>
+                MongoDB, PostgreSQL, and Redis get a persistent Docker volume.
+                FAISS is embedded in the Python service and uses a persistent
+                index volume. This provisions the database and connection
+                settings; it does not generate query or search code. Run all
+                starts the configured database with the service.
+              </span>
+            </div>
+
+            {databaseError && (
+              <div className="connection-error" role="alert">
+                {databaseError}
+              </div>
+            )}
+
+            <div className="modal-footer">
+              <button
+                className="secondary-button"
+                onClick={() => setDatabaseModalOpen(false)}
+                disabled={databaseBusy}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                onClick={configureServiceDatabase}
+                disabled={databaseBusy}
+              >
+                {databaseBusy ? (
+                  <LoaderCircle size={16} className="spin" />
+                ) : (
+                  <Database size={17} />
+                )}
+                {databaseBusy ? "Configuring..." : "Add database"}
               </button>
             </div>
           </div>
