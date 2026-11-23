@@ -2,99 +2,37 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import tzukGnome from "./assets/tzuk-gnome.png";
 import {
-  Activity,
   Boxes,
   Code2,
-  Database,
-  LayoutDashboard,
   Plus,
   Play,
   Square,
   LoaderCircle,
   Search,
   Settings,
-  Terminal,
-  Workflow,
   X,
   Server,
   Cpu,
   Network,
-  RadioTower,
-  Globe,
-  Webhook,
-  ArrowRight,
-  MessageSquare,
   Trash2,
-  Send,
 } from "lucide-react";
+import AiAssistantPanel from "./components/AiAssistantPanel";
+import ServiceConnectionsPanel from "./components/ServiceConnectionsPanel";
+import ServiceCreationModal from "./components/ServiceCreationModal";
+import ServiceDatabasePanel from "./components/ServiceDatabasePanel";
+import Sidebar from "./components/Sidebar";
+import { brokers, databaseOptions, languages, methods } from "./data";
+import type {
+  AiSuggestion,
+  CommandExecution,
+  Connection,
+  DatabaseType,
+  MessageBrokerType,
+  Service,
+  ServiceActionProgress,
+} from "./types";
 import "./App.css";
-
-type Service = {
-  id: number;
-  name: string;
-  language: string;
-  framework: string;
-  status: "Created";
-  database?: DatabaseType | null;
-};
-
-type DatabaseType = "mongo" | "postgres" | "redis" | "faiss";
-
-const databaseOptions: {
-  id: DatabaseType;
-  name: string;
-  description: string;
-}[] = [
-  {
-    id: "mongo",
-    name: "MongoDB",
-    description: "Document database, configured in a separate container.",
-  },
-  {
-    id: "postgres",
-    name: "PostgreSQL",
-    description: "Relational database with persistent storage.",
-  },
-  {
-    id: "redis",
-    name: "Redis",
-    description: "In-memory data store with persistent volume.",
-  },
-  {
-    id: "faiss",
-    name: "FAISS",
-    description: "Embedded vector index for Python services.",
-  },
-];
-
-type ConnectionMethod = "Messaging" | "REST API" | "gRPC" | "Webhooks";
-
-type Connection = {
-  id: number;
-  sourceId: number;
-  targetId: number;
-  method: ConnectionMethod;
-  broker: string | null;
-};
-
-type AiSuggestion = {
-  commandId: string | null;
-  command: string | null;
-  explanation: string;
-};
-
-type CommandExecution = {
-  command: string;
-  success: boolean;
-  output: string;
-};
-
-type ServiceActionProgress = {
-  name: string;
-  message: string;
-};
 
 type StoredWorkspace = {
   version: 1;
@@ -104,58 +42,6 @@ type StoredWorkspace = {
 };
 
 const workspaceStorageKey = "micronom.workspace";
-
-const languages = [
-  { name: "Node.js", framework: "Express", icon: "JS" },
-  { name: "Python", framework: "FastAPI", icon: "PY" },
-  { name: "Go", framework: "Gin", icon: "GO" },
-  { name: "Rust", framework: "Axum", icon: "RS" },
-];
-
-const methods: {
-  name: ConnectionMethod;
-  description: string;
-  icon: typeof Network;
-}[] = [
-  {
-    name: "Messaging",
-    description: "Asynchronous communication through message brokers.",
-    icon: RadioTower,
-  },
-  {
-    name: "REST API",
-    description: "HTTP requests between microservices.",
-    icon: Globe,
-  },
-  {
-    name: "gRPC",
-    description: "Fast, strongly typed service communication.",
-    icon: Network,
-  },
-  {
-    name: "Webhooks",
-    description: "Send event notifications between services.",
-    icon: Webhook,
-  },
-];
-
-const brokers = [
-  {
-    name: "RabbitMQ",
-    description: "Reliable message queues and routing.",
-    icon: "RMQ",
-  },
-  {
-    name: "Apache Kafka",
-    description: "Distributed event streaming.",
-    icon: "KFK",
-  },
-  {
-    name: "Redis Streams",
-    description: "Lightweight stream-based messaging.",
-    icon: "RED",
-  },
-];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -300,15 +186,8 @@ function App() {
   );
 
   const [modalOpen, setModalOpen] = useState(false);
-  const [connectionModalOpen, setConnectionModalOpen] = useState(false);
-  const [databaseModalOpen, setDatabaseModalOpen] = useState(false);
-
   const [serviceName, setServiceName] = useState("");
   const [language, setLanguage] = useState("Node.js");
-  const [databaseSelection, setDatabaseSelection] =
-    useState<DatabaseType>("postgres");
-  const [databaseError, setDatabaseError] = useState("");
-  const [databaseBusy, setDatabaseBusy] = useState(false);
   const [activeService, setActiveService] = useState<number | null>(
     savedWorkspace.workspace.activeServiceId
   );
@@ -316,12 +195,6 @@ function App() {
     savedWorkspace.workspace.activeServiceId
   );
 
-  const [connectionMethod, setConnectionMethod] =
-    useState<ConnectionMethod>("Messaging");
-  const [selectedBroker, setSelectedBroker] = useState("RabbitMQ");
-  const [targetServiceId, setTargetServiceId] = useState<number | "">("");
-
-  const [connectionError, setConnectionError] = useState("");
   const [aiModel, setAiModel] = useState("qwen2.5-coder:7b");
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiSuggestion, setAiSuggestion] = useState<AiSuggestion | null>(null);
@@ -335,16 +208,6 @@ function App() {
 
   const selectedService = services.find(
     (service) => service.id === activeService
-  );
-
-  const targetServices = services.filter(
-    (service) => service.id !== activeService
-  );
-
-  const serviceConnections = connections.filter(
-    (connection) =>
-      connection.sourceId === activeService ||
-      connection.targetId === activeService
   );
 
   const [bulkLoading, setBulkLoading] = useState(false);
@@ -375,15 +238,22 @@ function App() {
     if (savedWorkspace.hasSavedWorkspace || !isTauri()) return;
 
     let cancelled = false;
-    invoke<{
-      name: string;
-      language: string;
-      framework: string;
-      database: DatabaseType | null;
-    }[]>(
-      "list_service_folders"
-    )
-      .then((existingServices) => {
+    Promise.all([
+      invoke<{
+        name: string;
+        language: string;
+        framework: string;
+        database: DatabaseType | null;
+      }[]>("list_service_folders"),
+      invoke<{
+        id: number;
+        sourceService: string;
+        targetService: string;
+        method: "messaging" | "grpc";
+        broker: MessageBrokerType | null;
+      }[]>("list_service_connections"),
+    ])
+      .then(([existingServices, existingConnections]) => {
         if (cancelled) return;
 
         const restoredServices: Service[] = existingServices.map(
@@ -394,11 +264,42 @@ function App() {
             database: service.database,
           })
         );
+        const serviceIds = new Map(
+          restoredServices.map((service) => [service.name, service.id])
+        );
+        const restoredConnections: Connection[] = existingConnections.map(
+          (connection) => {
+            const sourceId = serviceIds.get(connection.sourceService);
+            const targetId = serviceIds.get(connection.targetService);
+            const broker = connection.broker
+              ? brokers.find((item) => item.id === connection.broker)
+              : undefined;
+            const isMessaging = connection.method === "messaging";
+            if (
+              !isSafeInteger(connection.id) ||
+              sourceId === undefined ||
+              targetId === undefined ||
+              (isMessaging && !broker) ||
+              (!isMessaging && connection.broker !== null)
+            ) {
+              throw new Error("Saved service connection data is invalid.");
+            }
+
+            return {
+              id: connection.id,
+              sourceId,
+              targetId,
+              method: isMessaging ? "Messaging" : "gRPC",
+              broker: isMessaging ? broker?.name ?? null : null,
+            };
+          }
+        );
         setServices(restoredServices);
+        setConnections(restoredConnections);
         const saveError = saveWorkspace({
           version: 1,
           services: restoredServices,
-          connections: [],
+          connections: restoredConnections,
           activeServiceId: null,
         });
         if (saveError) setWorkspaceStorageError(saveError);
@@ -465,32 +366,18 @@ function App() {
     }
   }
 
-  async function configureServiceDatabase() {
-    if (!selectedService) return;
-    const serviceId = selectedService.id;
+  function handleDatabaseConfigured(serviceId: number, database: DatabaseType) {
+    const nextServices = services.map((service) =>
+      service.id === serviceId ? { ...service, database } : service
+    );
+    setServices(nextServices);
+    persistWorkspaceState(nextServices, connections, activeService);
+  }
 
-    setDatabaseBusy(true);
-    setDatabaseError("");
-
-    try {
-      const database = await invoke<DatabaseType>(
-        "configure_service_database",
-        {
-          serviceName: selectedService.name,
-          databaseType: databaseSelection,
-        }
-      );
-      const nextServices = services.map((service) =>
-        service.id === serviceId ? { ...service, database } : service
-      );
-      setServices(nextServices);
-      persistWorkspaceState(nextServices, connections, activeService);
-      setDatabaseModalOpen(false);
-    } catch (error) {
-      setDatabaseError(`Could not configure database: ${String(error)}`);
-    } finally {
-      setDatabaseBusy(false);
-    }
+  function handleConnectionCreated(connection: Connection) {
+    const nextConnections = [...connections, connection];
+    setConnections(nextConnections);
+    persistWorkspaceState(services, nextConnections, activeService);
   }
 
   async function handleBulkAction(action: "run" | "stop") {
@@ -610,125 +497,12 @@ function App() {
     }
   }
 
-  function openConnectionModal() {
-    setConnectionMethod("Messaging");
-    setSelectedBroker("RabbitMQ");
-    setTargetServiceId("");
-    setConnectionError("");
-    setConnectionModalOpen(true);
-  }
-
-  function createConnection() {
-    if (activeService === null || targetServiceId === "") {
-      setConnectionError("Please select a destination microservice.");
-      return;
-    }
-
-    if (activeService === targetServiceId) {
-      setConnectionError("A service cannot connect to itself.");
-      return;
-    }
-
-    const alreadyExists = connections.some(
-      (connection) =>
-        connection.sourceId === activeService &&
-        connection.targetId === targetServiceId &&
-        connection.method === connectionMethod &&
-        connection.broker ===
-          (connectionMethod === "Messaging" ? selectedBroker : null)
-    );
-
-    if (alreadyExists) {
-      setConnectionError("This connection already exists.");
-      return;
-    }
-
-    const newConnection: Connection = {
-      id:
-        connections.reduce(
-          (highestId, existing) => Math.max(highestId, existing.id),
-          0
-        ) + 1,
-      sourceId: activeService,
-      targetId: targetServiceId,
-      method: connectionMethod,
-      broker:
-        connectionMethod === "Messaging" ? selectedBroker : null,
-    };
-
-    const nextConnections = [...connections, newConnection];
-    setConnections(nextConnections);
-    persistWorkspaceState(services, nextConnections, activeService);
-    setConnectionModalOpen(false);
-    setConnectionError("");
-  }
-
-  function getServiceName(id: number) {
-    return services.find((service) => service.id === id)?.name ?? "Unknown";
-  }
-
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-icon">
-            <Workflow size={22} />
-          </div>
-          <div>
-            <div className="brand-name">micronom</div>
-            <div className="brand-subtitle">MICROSERVICES STUDIO</div>
-          </div>
-        </div>
-
-        <div className="workspace-label">WORKSPACE</div>
-
-        <button className="nav-item active">
-          <LayoutDashboard size={17} />
-          Dashboard
-        </button>
-
-        <button className="nav-item">
-          <Boxes size={17} />
-          Microservices
-          <span className="nav-count">{services.length}</span>
-        </button>
-
-        <button className="nav-item">
-          <Database size={17} />
-          Databases
-        </button>
-
-        <button className="nav-item">
-          <Network size={17} />
-          Connections
-          <span className="nav-count">{connections.length}</span>
-        </button>
-
-        <button className="nav-item">
-          <Activity size={17} />
-          Monitoring
-        </button>
-
-        <div className="sidebar-bottom">
-          <div className="workspace-label">SYSTEM</div>
-          <button className="nav-item">
-            <Terminal size={17} />
-            Logs
-          </button>
-          <button className="nav-item">
-            <Settings size={17} />
-            Settings
-          </button>
-
-          <div className="engine-status">
-            <span className="status-dot" />
-            <div>
-              <div className="engine-title">Micronom Engine</div>
-              <div className="engine-subtitle">Desktop environment</div>
-            </div>
-          </div>
-        </div>
-      </aside>
+      <Sidebar
+        serviceCount={services.length}
+        connectionCount={connections.length}
+      />
 
       <main className="main-content">
         <header className="topbar">
@@ -936,587 +710,53 @@ function App() {
               </div>
               </div>
 
-              <div className="connection-panel">
-                <div className="connection-panel-heading">
-                  <div>
-                    <h3>Service connections</h3>
-                    <p>Connect this microservice to other services.</p>
-                  </div>
-                  <button
-                    className="primary-button"
-                    onClick={openConnectionModal}
-                    disabled={services.length < 2}
-                    title={
-                      services.length < 2
-                        ? "Create another microservice first"
-                        : "Create a connection"
-                    }
-                  >
-                    <Plus size={17} />
-                    Connect
-                  </button>
-                </div>
-
-                {serviceConnections.length === 0 ? (
-                  <div className="connection-empty">
-                    <div className="empty-icon">
-                      <Network size={26} />
-                    </div>
-                    <h3>No connections yet</h3>
-                    <p>
-                      Connect {selectedService.name} to another microservice
-                      using messaging, REST, gRPC or webhooks.
-                    </p>
-                    {services.length < 2 && (
-                      <small>Create at least two microservices to connect them.</small>
-                    )}
-                  </div>
-                ) : (
-                  <div className="connection-list">
-                    {serviceConnections.map((connection) => {
-                      const isOutgoing =
-                        connection.sourceId === selectedService.id;
-
-                      return (
-                        <div className="connection-item" key={connection.id}>
-                          <div className="connection-item-icon">
-                            {connection.method === "Messaging" ? (
-                              <RadioTower size={19} />
-                            ) : connection.method === "REST API" ? (
-                              <Globe size={19} />
-                            ) : connection.method === "gRPC" ? (
-                              <Network size={19} />
-                            ) : (
-                              <Webhook size={19} />
-                            )}
-                          </div>
-                          <div className="connection-item-info">
-                            <strong>
-                              {isOutgoing
-                                ? `To ${getServiceName(connection.targetId)}`
-                                : `From ${getServiceName(connection.sourceId)}`}
-                            </strong>
-                            <span>
-                              {connection.method}
-                              {connection.broker
-                                ? ` · ${connection.broker}`
-                                : ""}
-                            </span>
-                          </div>
-                          <span className="connection-direction">
-                            {isOutgoing ? "Outgoing" : "Incoming"}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <div className="database-panel">
-                <div className="database-panel-heading">
-                  <div>
-                    <h3>Database</h3>
-                    <p>
-                      Provision one persistent database for this microservice.
-                    </p>
-                  </div>
-                  {!selectedService.database && (
-                    <button
-                      className="primary-button"
-                      onClick={() => {
-                        setDatabaseSelection("postgres");
-                        setDatabaseError("");
-                        setDatabaseModalOpen(true);
-                      }}
-                    >
-                      <Plus size={17} />
-                      Connect database
-                    </button>
-                  )}
-                </div>
-
-                {selectedService.database ? (
-                  <div className="database-configured">
-                    <Database size={18} />
-                    <div>
-                      <strong>
-                        {
-                          databaseOptions.find(
-                            (database) =>
-                              database.id === selectedService.database
-                          )?.name
-                        }{" "}
-                        configured
-                      </strong>
-                      <p>
-                        {selectedService.database === "faiss"
-                          ? "A FAISS index volume will be mounted in this Python service."
-                          : "A persistent database container and connection URL are configured."}{" "}
-                        Click Run all to start the service with its database.
-                      </p>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="database-empty">
-                    Select MongoDB, PostgreSQL, Redis, or FAISS for Python
-                    services. Credentials are stored in the service’s ignored
-                    .env file.
-                  </p>
-                )}
-              </div>
-
-              <div className="ai-panel">
-                <div className="ai-panel-heading">
-                  <div className="ai-panel-icon">
-                    <img src={tzukGnome} alt="" />
-                  </div>
-                  <div>
-                    <h3>Tzuk</h3>
-                    <p>Local development assistant powered by Ollama.</p>
-                  </div>
-                </div>
-
-                <label className="ai-model-label" htmlFor="ollama-model">
-                  OLLAMA MODEL
-                </label>
-                <input
-                  id="ollama-model"
-                  className="ai-input"
-                  value={aiModel}
-                  onChange={(event) => {
-                    setAiModel(event.target.value);
-                    setAiSuggestion(null);
-                    setAiExecution(null);
-                    setAiError("");
-                  }}
-                  placeholder="e.g. qwen2.5-coder:7b"
-                  disabled={aiBusy !== null}
-                />
-
-                <label className="ai-model-label" htmlFor="ai-request">
-                  WHAT SHOULD I DO?
-                </label>
-                <textarea
-                  id="ai-request"
-                  className="ai-input ai-prompt"
-                  value={aiPrompt}
-                  onChange={(event) => {
-                    setAiPrompt(event.target.value);
-                    setAiSuggestion(null);
-                    setAiExecution(null);
-                    setAiError("");
-                  }}
-                  placeholder="e.g. Install this service's dependencies"
-                  maxLength={4000}
-                  disabled={aiBusy !== null}
-                />
-
-                <div className="ai-actions">
-                  <button
-                    className="primary-button"
-                    onClick={askAiForCommand}
-                    disabled={aiBusy !== null || !aiPrompt.trim() || !aiModel.trim()}
-                  >
-                    {aiBusy === "suggesting" ? (
-                      <LoaderCircle size={16} className="spin" />
-                    ) : (
-                      <Send size={16} />
-                    )}
-                    {aiBusy === "suggesting" ? "Asking Ollama..." : "Ask AI"}
-                  </button>
-                </div>
-
-                {aiBusy === "suggesting" && (
-                  <p className="ai-status" role="status" aria-live="polite">
-                    Waiting for local Ollama. The first response may take a little
-                    longer.
-                  </p>
-                )}
-
-                <p className="ai-safety-note">
-                  Commands are limited to predefined language-specific tasks.
-                  Review each suggestion and confirm before it runs.
-                </p>
-
-                {aiSuggestion && (
-                  <div className="ai-suggestion">
-                    <strong>
-                      {aiSuggestion.command ? "Suggestion" : "No command to run"}
-                    </strong>
-                    <p>{aiSuggestion.explanation}</p>
-                    {aiSuggestion.command ? (
-                      <>
-                        <code>{aiSuggestion.command}</code>
-                        <button
-                          className="primary-button"
-                          onClick={runSuggestedCommand}
-                          disabled={aiBusy !== null}
-                        >
-                          {aiBusy === "running" ? (
-                            <LoaderCircle size={16} className="spin" />
-                          ) : (
-                            <Play size={16} />
-                          )}
-                          Run this command
-                        </button>
-                      </>
-                    ) : (
-                      <p>
-                        This assistant only recommends predefined development
-                        commands. Try a request such as “Install dependencies.”
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {aiExecution && (
-                  <div className={`ai-output ${aiExecution.success ? "success" : "failure"}`}>
-                    <strong>
-                      {aiExecution.success ? "Command completed" : "Command failed"}:{" "}
-                      {aiExecution.command}
-                    </strong>
-                    <pre>{aiExecution.output}</pre>
-                  </div>
-                )}
-
-                {aiError && <p className="ai-error" role="alert">{aiError}</p>}
-              </div>
+              <ServiceConnectionsPanel
+                service={selectedService}
+                services={services}
+                connections={connections}
+                onConnectionCreated={handleConnectionCreated}
+              />
+              <ServiceDatabasePanel
+                service={selectedService}
+                onDatabaseConfigured={handleDatabaseConfigured}
+              />
+              <AiAssistantPanel
+                model={aiModel}
+                prompt={aiPrompt}
+                suggestion={aiSuggestion}
+                execution={aiExecution}
+                error={aiError}
+                busy={aiBusy}
+                onModelChange={(value) => {
+                  setAiModel(value);
+                  setAiSuggestion(null);
+                  setAiExecution(null);
+                  setAiError("");
+                }}
+                onPromptChange={(value) => {
+                  setAiPrompt(value);
+                  setAiSuggestion(null);
+                  setAiExecution(null);
+                  setAiError("");
+                }}
+                onAsk={askAiForCommand}
+                onRun={runSuggestedCommand}
+              />
             </section>
           )}
         </div>
       </main>
 
-      {modalOpen && (
-        <div
-          className="modal-overlay"
-          onClick={() => setModalOpen(false)}
-        >
-          <div
-            className="modal"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-header">
-              <div>
-                <h2>Create microservice</h2>
-                <p>Configure your new service.</p>
-              </div>
-              <button
-                className="icon-button"
-                onClick={() => setModalOpen(false)}
-              >
-                <X size={19} />
-              </button>
-            </div>
-
-            <label className="field-label">SERVICE NAME</label>
-            <input
-              className="text-input"
-              placeholder="e.g. user-service"
-              value={serviceName}
-              onChange={(event) => setServiceName(event.target.value)}
-              autoFocus
-            />
-
-            <label className="field-label language-label">
-              PROGRAMMING LANGUAGE
-            </label>
-
-            <div className="language-grid">
-              {languages.map((item) => (
-                <button
-                  key={item.name}
-                  className={`language-option ${
-                    language === item.name ? "selected" : ""
-                  }`}
-                  onClick={() => setLanguage(item.name)}
-                >
-                  <span className="language-icon">{item.icon}</span>
-                  <span className="language-info">
-                    <strong>{item.name}</strong>
-                    <small>{item.framework}</small>
-                  </span>
-                  <span className="language-radio">
-                    {language === item.name ? "✓" : ""}
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            <div className="modal-footer">
-              <button
-                className="secondary-button"
-                onClick={() => setModalOpen(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="primary-button"
-                onClick={createService}
-                disabled={!serviceName.trim()}
-              >
-                <Plus size={17} />
-                Create service
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {connectionModalOpen && selectedService && (
-        <div
-          className="modal-overlay"
-          onClick={() => setConnectionModalOpen(false)}
-        >
-          <div
-            className="modal connection-modal"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-header">
-              <div>
-                <div className="eyebrow">SERVICE CONNECTION</div>
-                <h2>Connect microservice</h2>
-                <p>Configure communication for {selectedService.name}.</p>
-              </div>
-              <button
-                className="icon-button"
-                onClick={() => setConnectionModalOpen(false)}
-              >
-                <X size={19} />
-              </button>
-            </div>
-
-            <label className="field-label">1. COMMUNICATION METHOD</label>
-
-            <div className="connection-method-grid">
-              {methods.map((method) => {
-                const Icon = method.icon;
-
-                return (
-                  <button
-                    key={method.name}
-                    className={`connection-method-option ${
-                      connectionMethod === method.name ? "selected" : ""
-                    }`}
-                    onClick={() => {
-                      setConnectionMethod(method.name);
-                      setConnectionError("");
-                    }}
-                  >
-                    <Icon size={21} />
-                    <strong>{method.name}</strong>
-                    <small>{method.description}</small>
-                  </button>
-                );
-              })}
-            </div>
-
-            {connectionMethod === "Messaging" && (
-              <>
-                <label className="field-label connection-field-label">
-                  2. SELECT MESSAGE BROKER
-                </label>
-
-                <div className="broker-grid">
-                  {brokers.map((broker) => (
-                    <button
-                      key={broker.name}
-                      className={`broker-option ${
-                        selectedBroker === broker.name ? "selected" : ""
-                      }`}
-                      onClick={() => setSelectedBroker(broker.name)}
-                    >
-                      <span className="broker-icon">{broker.icon}</span>
-                      <span className="broker-info">
-                        <strong>{broker.name}</strong>
-                        <small>{broker.description}</small>
-                      </span>
-                      <span className="language-radio">
-                        {selectedBroker === broker.name ? "✓" : ""}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-
-            <label className="field-label connection-field-label">
-              {connectionMethod === "Messaging" ? "3." : "2."} DESTINATION MICROSERVICE
-            </label>
-
-            <select
-              className="text-input connection-select"
-              value={targetServiceId}
-              onChange={(event) => {
-                setTargetServiceId(
-                  event.target.value === ""
-                    ? ""
-                    : Number(event.target.value)
-                );
-                setConnectionError("");
-              }}
-            >
-              <option value="">Select a microservice...</option>
-              {targetServices.map((service) => (
-                <option key={service.id} value={service.id}>
-                  {service.name} — {service.language}
-                </option>
-              ))}
-            </select>
-
-            <div className="connection-preview">
-              <div className="connection-preview-service">
-                <Server size={18} />
-                <span>{selectedService.name}</span>
-              </div>
-              <ArrowRight size={18} />
-              <div className="connection-preview-service">
-                <Server size={18} />
-                <span>
-                  {targetServiceId === ""
-                    ? "Destination"
-                    : getServiceName(targetServiceId)}
-                </span>
-              </div>
-            </div>
-
-            {connectionError && (
-              <div className="connection-error">{connectionError}</div>
-            )}
-
-            <div className="connection-note">
-              <MessageSquare size={16} />
-              <span>
-                This creates a connection configuration in Micronom.
-                Docker deployment and code generation will be added next.
-              </span>
-            </div>
-
-            <div className="modal-footer">
-              <button
-                className="secondary-button"
-                onClick={() => setConnectionModalOpen(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="primary-button"
-                onClick={createConnection}
-                disabled={targetServices.length === 0}
-              >
-                <Network size={17} />
-                Create connection
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {databaseModalOpen && selectedService && (
-        <div
-          className="modal-overlay"
-          onClick={() => setDatabaseModalOpen(false)}
-        >
-          <div
-            className="modal database-modal"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-header">
-              <div>
-                <div className="eyebrow">DATABASE SETUP</div>
-                <h2>Connect a database</h2>
-                <p>Choose one database for {selectedService.name}.</p>
-              </div>
-              <button
-                className="icon-button"
-                onClick={() => setDatabaseModalOpen(false)}
-                title="Close database setup"
-              >
-                <X size={19} />
-              </button>
-            </div>
-
-            <div className="database-option-list">
-              {databaseOptions.map((database) => {
-                const unavailable =
-                  database.id === "faiss" &&
-                  selectedService.language !== "Python";
-
-                return (
-                  <button
-                    key={database.id}
-                    className={`database-option ${
-                      databaseSelection === database.id ? "selected" : ""
-                    }`}
-                    onClick={() => {
-                      setDatabaseSelection(database.id);
-                      setDatabaseError("");
-                    }}
-                    disabled={unavailable || databaseBusy}
-                    title={
-                      unavailable
-                        ? "FAISS is currently supported only for Python services"
-                        : undefined
-                    }
-                  >
-                    <Database size={20} />
-                    <span>
-                      <strong>{database.name}</strong>
-                      <small>
-                        {unavailable
-                          ? "Currently available for Python services only."
-                          : database.description}
-                      </small>
-                    </span>
-                    <span className="language-radio">
-                      {databaseSelection === database.id ? "✓" : ""}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="connection-note">
-              <Database size={16} />
-              <span>
-                MongoDB, PostgreSQL, and Redis get a persistent Docker volume.
-                FAISS is embedded in the Python service and uses a persistent
-                index volume. This provisions the database and connection
-                settings; it does not generate query or search code. Run all
-                starts the configured database with the service.
-              </span>
-            </div>
-
-            {databaseError && (
-              <div className="connection-error" role="alert">
-                {databaseError}
-              </div>
-            )}
-
-            <div className="modal-footer">
-              <button
-                className="secondary-button"
-                onClick={() => setDatabaseModalOpen(false)}
-                disabled={databaseBusy}
-              >
-                Cancel
-              </button>
-              <button
-                className="primary-button"
-                onClick={configureServiceDatabase}
-                disabled={databaseBusy}
-              >
-                {databaseBusy ? (
-                  <LoaderCircle size={16} className="spin" />
-                ) : (
-                  <Database size={17} />
-                )}
-                {databaseBusy ? "Configuring..." : "Add database"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ServiceCreationModal
+        open={modalOpen}
+        serviceName={serviceName}
+        language={language}
+        languages={languages}
+        onServiceNameChange={setServiceName}
+        onLanguageChange={setLanguage}
+        onCreate={createService}
+        onClose={() => setModalOpen(false)}
+      />
     </div>
   );
 }

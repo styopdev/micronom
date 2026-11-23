@@ -1,4 +1,5 @@
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,76 @@ enum DatabaseType {
     Postgres,
     Redis,
     Faiss,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BrokerType {
+    RabbitMq,
+    Kafka,
+    RedisStreams,
+}
+
+impl BrokerType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RabbitMq => "rabbit_mq",
+            Self::Kafka => "kafka",
+            Self::RedisStreams => "redis_streams",
+        }
+    }
+
+    fn env_key(self) -> &'static str {
+        match self {
+            Self::RabbitMq => "RABBITMQ_URL",
+            Self::Kafka => "KAFKA_BOOTSTRAP_SERVERS",
+            Self::RedisStreams => "REDIS_STREAMS_URL",
+        }
+    }
+
+    fn secret_key(self) -> Option<&'static str> {
+        match self {
+            Self::RabbitMq => Some("RABBITMQ_PASSWORD"),
+            Self::Kafka => None,
+            Self::RedisStreams => Some("REDIS_STREAMS_PASSWORD"),
+        }
+    }
+
+    fn connection_url(self, password: Option<&str>) -> Result<String, String> {
+        match self {
+            Self::RabbitMq => {
+                let password = password
+                    .ok_or_else(|| "RabbitMQ credentials were not generated.".to_string())?;
+                Ok(format!("amqp://micronom:{password}@rabbitmq:5672"))
+            }
+            Self::Kafka => Ok("kafka:9092".into()),
+            Self::RedisStreams => {
+                let password = password
+                    .ok_or_else(|| "Redis Streams credentials were not generated.".to_string())?;
+                Ok(format!("redis://:{password}@redis-streams:6379/0"))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceConnectionType {
+    #[default]
+    Messaging,
+    Grpc,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceConnection {
+    id: u64,
+    source_service: String,
+    target_service: String,
+    #[serde(default)]
+    method: ServiceConnectionType,
+    #[serde(default)]
+    broker: Option<BrokerType>,
 }
 
 impl DatabaseType {
@@ -242,6 +313,20 @@ struct ExistingService {
     database: Option<DatabaseType>,
 }
 
+fn detect_service_language(directory: &Path) -> Option<(&'static str, &'static str)> {
+    if directory.join("package.json").is_file() {
+        Some(("Node.js", "Express"))
+    } else if directory.join("requirements.txt").is_file() {
+        Some(("Python", "FastAPI"))
+    } else if directory.join("go.mod").is_file() {
+        Some(("Go", "Gin"))
+    } else if directory.join("Cargo.toml").is_file() {
+        Some(("Rust", "Axum"))
+    } else {
+        None
+    }
+}
+
 fn read_database_type(directory: &Path) -> Result<Option<DatabaseType>, String> {
     let path = directory.join(".micronom").join("database.json");
     match std::fs::read_to_string(path) {
@@ -251,6 +336,40 @@ fn read_database_type(directory: &Path) -> Result<Option<DatabaseType>, String> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("Could not read service database configuration: {error}")),
     }
+}
+
+fn service_connections_path(app_dir: &Path) -> PathBuf {
+    app_dir.join(".micronom").join("connections.json")
+}
+
+fn read_service_connections(app_dir: &Path) -> Result<Vec<ServiceConnection>, String> {
+    match std::fs::read_to_string(service_connections_path(app_dir)) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|error| format!("Could not read service connections: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("Could not read service connections: {error}")),
+    }
+}
+
+fn write_service_connections(
+    app_dir: &Path,
+    connections: &[ServiceConnection],
+) -> Result<(), String> {
+    let contents = serde_json::to_string_pretty(connections)
+        .map_err(|error| format!("Could not save service connections: {error}"))?;
+    write_file(
+        app_dir,
+        ".micronom/connections.json",
+        &format!("{contents}\n"),
+    )
+}
+
+#[tauri::command]
+fn list_service_connections() -> Result<Vec<ServiceConnection>, String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+    read_service_connections(&PathBuf::from(home).join("app"))
 }
 
 #[tauri::command]
@@ -290,17 +409,7 @@ fn list_service_folders() -> Result<Vec<ExistingService>, String> {
         }
 
         let directory = entry.path();
-        let metadata = if directory.join("package.json").is_file() {
-            Some(("Node.js", "Express"))
-        } else if directory.join("requirements.txt").is_file() {
-            Some(("Python", "FastAPI"))
-        } else if directory.join("go.mod").is_file() {
-            Some(("Go", "Gin"))
-        } else if directory.join("Cargo.toml").is_file() {
-            Some(("Rust", "Axum"))
-        } else {
-            None
-        };
+        let metadata = detect_service_language(&directory);
 
         if let Some((language, framework)) = metadata {
             services.push(ExistingService {
@@ -377,9 +486,68 @@ fn allowed_command_ids(language: &str) -> Option<&'static [&'static str]> {
 #[cfg(test)]
 mod command_tests {
     use super::{
-        allowed_command_ids, command_for_id, database_env_entries, generate_database_compose,
-        DatabaseType,
+        BrokerType, DatabaseType, ServiceConnection, ServiceConnectionType,
+        allowed_command_ids, command_for_id, database_env_entries, ensure_service_dependencies,
+        generate_database_compose, generate_service_connection_compose,
+        generate_workspace_broker_compose, sync_service_connection_artifacts,
     };
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn temporary_app_directory() -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "micronom-messaging-test-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn create_test_service(app_dir: &std::path::Path, name: &str) {
+        let service_dir = app_dir.join(name);
+        std::fs::create_dir_all(&service_dir).unwrap();
+        std::fs::write(service_dir.join(".env"), "EXISTING=value\n").unwrap();
+        std::fs::write(
+            service_dir.join("docker-compose.yml"),
+            format!("services:\n  {name}:\n    image: alpine\n"),
+        )
+        .unwrap();
+        std::fs::write(service_dir.join(".dockerignore"), "").unwrap();
+        std::fs::write(
+            service_dir.join("package.json"),
+            r#"{"name":"test-service","dependencies":{"express":"^5.1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(service_dir.join("README.md"), "# Test service\n").unwrap();
+    }
+
+    fn validate_compose_config(directory: &std::path::Path, files: &[&str]) {
+        let mut command = Command::new("docker");
+        command.arg("compose");
+        for file in files {
+            command.args(["-f", file]);
+        }
+        let output = command
+            .arg("config")
+            .current_dir(directory)
+            .output();
+
+        match output {
+            Ok(output) => assert!(
+                output.status.success(),
+                "Docker Compose config failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("Skipping Docker Compose config validation: Docker is not installed.");
+            }
+            Err(error) => panic!("Could not execute Docker Compose config: {error}"),
+        }
+    }
 
     #[test]
     fn command_allowlist_is_scoped_to_service_language() {
@@ -440,6 +608,213 @@ mod command_tests {
         assert!(environment.iter().any(|(key, value)| {
             *key == "FAISS_INDEX_PATH" && value == "/data/faiss"
         }));
+    }
+
+    #[test]
+    fn broker_compose_contains_only_the_selected_persistent_services() {
+        let compose = generate_workspace_broker_compose(&[
+            BrokerType::RabbitMq,
+            BrokerType::Kafka,
+            BrokerType::RedisStreams,
+        ]);
+
+        assert!(compose.contains("image: rabbitmq:4-management"));
+        assert!(compose.contains("image: apache/kafka:4.1.1"));
+        assert!(compose.contains("image: redis:7-alpine"));
+        assert!(compose.contains("rabbitmq-data:/var/lib/rabbitmq"));
+        assert!(compose.contains("kafka-data:/var/lib/kafka/data"));
+        assert!(compose.contains("redis-streams-data:/data"));
+        assert!(compose.contains("external: true"));
+
+        let kafka_only = generate_workspace_broker_compose(&[BrokerType::Kafka]);
+        assert!(kafka_only.contains("image: apache/kafka:4.1.1"));
+        assert!(!kafka_only.contains("image: rabbitmq:4-management"));
+        assert!(!kafka_only.contains("image: redis:7-alpine"));
+    }
+
+    #[test]
+    fn service_connection_overlay_exports_the_selected_broker_urls() {
+        let environment_keys = vec![
+            "RABBITMQ_URL".to_string(),
+            "KAFKA_BOOTSTRAP_SERVERS".to_string(),
+        ];
+        let compose = generate_service_connection_compose(
+            "catalog",
+            &environment_keys,
+        );
+
+        assert!(compose.contains("RABBITMQ_URL: \"${RABBITMQ_URL}\""));
+        assert!(compose.contains("KAFKA_BOOTSTRAP_SERVERS: \"${KAFKA_BOOTSTRAP_SERVERS}\""));
+        assert!(!compose.contains("REDIS_STREAMS_URL"));
+        assert!(compose.contains("name: micronom-services"));
+    }
+
+    #[test]
+    fn syncing_message_connections_writes_credentials_urls_and_service_overlays() {
+        let app_dir = temporary_app_directory();
+        create_test_service(&app_dir, "catalog");
+        create_test_service(&app_dir, "worker");
+        let connections = vec![
+            ServiceConnection {
+                id: 1,
+                source_service: "catalog".into(),
+                target_service: "worker".into(),
+                method: ServiceConnectionType::Messaging,
+                broker: Some(BrokerType::RabbitMq),
+            },
+            ServiceConnection {
+                id: 2,
+                source_service: "catalog".into(),
+                target_service: "worker".into(),
+                method: ServiceConnectionType::Messaging,
+                broker: Some(BrokerType::Kafka),
+            },
+            ServiceConnection {
+                id: 3,
+                source_service: "catalog".into(),
+                target_service: "worker".into(),
+                method: ServiceConnectionType::Messaging,
+                broker: Some(BrokerType::RedisStreams),
+            },
+        ];
+
+        sync_service_connection_artifacts(&app_dir, &connections).unwrap();
+
+        let secrets =
+            std::fs::read_to_string(app_dir.join(".micronom").join("brokers").join(".env"))
+                .unwrap();
+        let broker_compose = std::fs::read_to_string(
+            app_dir
+                .join(".micronom")
+                .join("brokers")
+                .join("docker-compose.yml"),
+        )
+        .unwrap();
+        let service_env = std::fs::read_to_string(app_dir.join("catalog").join(".env")).unwrap();
+        let service_compose = std::fs::read_to_string(
+            app_dir
+                .join("catalog")
+                .join("docker-compose.connections.yml"),
+        )
+        .unwrap();
+        let worker_env = std::fs::read_to_string(app_dir.join("worker").join(".env")).unwrap();
+
+        validate_compose_config(
+            &app_dir.join(".micronom").join("brokers"),
+            &["docker-compose.yml"],
+        );
+        validate_compose_config(
+            &app_dir.join("catalog"),
+            &["docker-compose.yml", "docker-compose.connections.yml"],
+        );
+
+        assert!(secrets.contains("RABBITMQ_PASSWORD="));
+        assert!(secrets.contains("REDIS_STREAMS_PASSWORD="));
+        assert!(!broker_compose.contains("RABBITMQ_PASSWORD="));
+        assert!(service_env.contains("EXISTING=value"));
+        assert!(service_env.contains("amqp://micronom:"));
+        assert!(service_env.contains("KAFKA_BOOTSTRAP_SERVERS=kafka:9092"));
+        assert!(service_env.contains("redis://:"));
+        assert!(worker_env.contains("RABBITMQ_URL="));
+        assert!(service_compose.contains("RABBITMQ_URL"));
+        assert!(service_compose.contains("KAFKA_BOOTSTRAP_SERVERS"));
+        let package_json =
+            std::fs::read_to_string(app_dir.join("catalog").join("package.json")).unwrap();
+        assert!(package_json.contains("\"amqplib\""));
+
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn grpc_connection_adds_dependencies_and_shared_network_addresses() {
+        let app_dir = temporary_app_directory();
+        create_test_service(&app_dir, "api");
+        create_test_service(&app_dir, "billing");
+        let connections = vec![ServiceConnection {
+            id: 1,
+            source_service: "api".into(),
+            target_service: "billing".into(),
+            method: ServiceConnectionType::Grpc,
+            broker: None,
+        }];
+
+        sync_service_connection_artifacts(&app_dir, &connections).unwrap();
+
+        let source_env = std::fs::read_to_string(app_dir.join("api").join(".env")).unwrap();
+        let target_env = std::fs::read_to_string(app_dir.join("billing").join(".env")).unwrap();
+        let source_compose = std::fs::read_to_string(
+            app_dir
+                .join("api")
+                .join("docker-compose.connections.yml"),
+        )
+        .unwrap();
+        let source_manifest =
+            std::fs::read_to_string(app_dir.join("api").join("package.json")).unwrap();
+        let target_readme =
+            std::fs::read_to_string(app_dir.join("billing").join("README.md")).unwrap();
+
+        assert!(source_env.contains("GRPC_TARGET_BILLING=billing:50051"));
+        assert!(target_env.contains("GRPC_LISTEN_ADDRESS=0.0.0.0:50051"));
+        assert!(source_compose.contains("GRPC_TARGET_BILLING"));
+        assert!(source_compose.contains("name: micronom-services"));
+        assert!(source_manifest.contains("\"@grpc/grpc-js\""));
+        assert!(source_manifest.contains("\"@grpc/proto-loader\""));
+        assert!(target_readme.contains("RPC handler code"));
+
+        validate_compose_config(
+            &app_dir.join("api"),
+            &["docker-compose.yml", "docker-compose.connections.yml"],
+        );
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn connection_dependencies_are_added_idempotently_for_every_language() {
+        let app_dir = temporary_app_directory();
+        let fixtures = [
+            ("node", "package.json", r#"{"name":"node","dependencies":{}}"#),
+            ("python", "requirements.txt", "fastapi>=0.115,<1.0\n"),
+            ("go", "go.mod", "module example.com/go\n\ngo 1.24\n"),
+            (
+                "rust",
+                "Cargo.toml",
+                "[package]\nname = \"rust\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
+            ),
+        ];
+
+        for (name, manifest, contents) in fixtures {
+            let service_dir = app_dir.join(name);
+            std::fs::create_dir_all(&service_dir).unwrap();
+            std::fs::write(service_dir.join(manifest), contents).unwrap();
+            ensure_service_dependencies(&service_dir, true, true).unwrap();
+            ensure_service_dependencies(&service_dir, true, true).unwrap();
+        }
+
+        let node = std::fs::read_to_string(app_dir.join("node").join("package.json")).unwrap();
+        let python =
+            std::fs::read_to_string(app_dir.join("python").join("requirements.txt")).unwrap();
+        let go = std::fs::read_to_string(app_dir.join("go").join("go.mod")).unwrap();
+        let rust = std::fs::read_to_string(app_dir.join("rust").join("Cargo.toml")).unwrap();
+
+        assert_eq!(node.matches("\"amqplib\"").count(), 1);
+        assert_eq!(node.matches("\"@grpc/grpc-js\"").count(), 1);
+        assert_eq!(python.matches("pika>=").count(), 1);
+        assert_eq!(python.matches("grpcio>=").count(), 1);
+        assert_eq!(go.matches("github.com/rabbitmq/amqp091-go").count(), 1);
+        assert_eq!(go.matches("google.golang.org/grpc").count(), 1);
+        assert_eq!(rust.matches("lapin =").count(), 1);
+        assert_eq!(rust.matches("tonic =").count(), 1);
+
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn old_messaging_connection_records_default_to_messaging() {
+        let old_format = r#"[{"id":1,"sourceService":"api","targetService":"billing","broker":"rabbit_mq"}]"#;
+        let connections: Vec<ServiceConnection> = serde_json::from_str(old_format).unwrap();
+
+        assert_eq!(connections[0].method, ServiceConnectionType::Messaging);
+        assert_eq!(connections[0].broker, Some(BrokerType::RabbitMq));
     }
 }
 
@@ -1125,7 +1500,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             create_service_folder,
             configure_service_database,
+            configure_message_connection,
+            configure_grpc_connection,
             list_service_folders,
+            list_service_connections,
             suggest_service_command,
             execute_service_command,
             remove_service_folder,
@@ -1160,10 +1538,11 @@ fn remove_service_folder(name: String) -> Result<(), String> {
         return Err("Invalid microservice name.".to_string());
     }
 
-    let home = std::env::var("USERPROFILE")
-        .map_err(|_| "Could not find the user profile directory.".to_string())?;
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user profile directory.".to_string())?;
 
-    let app_dir = std::path::PathBuf::from(home).join("app");
+    let app_dir = PathBuf::from(home).join("app");
 
     let canonical_app = app_dir
         .canonicalize()
@@ -1184,23 +1563,55 @@ fn remove_service_folder(name: String) -> Result<(), String> {
         return Err("The microservice path is not a directory.".to_string());
     }
 
+    let connections = read_service_connections(&canonical_app)?;
+    let original_connection_count = connections.len();
+    let remaining_connections = connections
+        .into_iter()
+        .filter(|connection| connection.source_service != name && connection.target_service != name)
+        .collect::<Vec<_>>();
+    let connections_changed = remaining_connections.len() != original_connection_count;
+
     fs::remove_dir_all(&canonical_service)
         .map_err(|error| format!("Failed to delete microservice: {}", error))?;
 
+    if connections_changed {
+        sync_service_connection_artifacts(&canonical_app, &remaining_connections)?;
+        write_service_connections(&canonical_app, &remaining_connections)?;
+    }
+
     Ok(())
+}
+
+fn write_environment_file(
+    directory: &Path,
+    file_name: &str,
+    entries: &[(&str, String)],
+    replace_keys: &[&str],
+) -> Result<(), String> {
+    let path = directory.join(file_name);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("Could not read {file_name}: {error}")),
+    };
+
+    let mut lines = existing
+        .lines()
+        .filter(|line| {
+            let key = line.split_once('=').map(|(key, _)| key.trim());
+            !key.is_some_and(|key| replace_keys.contains(&key))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    lines.extend(entries.iter().map(|(key, value)| format!("{key}={value}")));
+    write_file(directory, file_name, &format!("{}\n", lines.join("\n")))
 }
 
 fn write_database_environment(
     service_dir: &Path,
     entries: &[(&str, String)],
 ) -> Result<(), String> {
-    let path = service_dir.join(".env");
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("Could not read service environment: {error}")),
-    };
-
     let database_keys = [
         "DATABASE_TYPE",
         "DATABASE_URL",
@@ -1210,21 +1621,714 @@ fn write_database_environment(
         "REDIS_PASSWORD",
         "FAISS_INDEX_PATH",
     ];
+    write_environment_file(service_dir, ".env", entries, &database_keys)
+}
+
+const MESSAGE_CONNECTION_ENV_KEYS: &[&str] = &[
+    "RABBITMQ_URL",
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "REDIS_STREAMS_URL",
+];
+const BROKER_SECRET_ENV_KEYS: &[&str] = &[
+    "RABBITMQ_USER",
+    "RABBITMQ_PASSWORD",
+    "REDIS_STREAMS_PASSWORD",
+];
+
+fn read_environment_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (entry_key, value) = line.split_once('=')?;
+        (entry_key.trim() == key).then(|| value.trim().to_string())
+    })
+}
+
+fn read_optional_environment_file(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
+fn add_node_dependencies(service_dir: &Path, dependencies: &[(&str, &str)]) -> Result<(), String> {
+    let path = service_dir.join("package.json");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read package.json: {error}"))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("Could not parse package.json: {error}"))?;
+    let manifest = manifest
+        .as_object_mut()
+        .ok_or_else(|| "The package.json root must be an object.".to_string())?;
+    let dependency_map = manifest
+        .entry("dependencies")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "The package.json dependencies must be an object.".to_string())?;
+
+    let mut changed = false;
+    for (name, version) in dependencies {
+        if !dependency_map.contains_key(*name) {
+            dependency_map.insert(
+                (*name).to_string(),
+                serde_json::Value::String((*version).to_string()),
+            );
+            changed = true;
+        }
+    }
+
+    if changed {
+        let updated = serde_json::to_string_pretty(&manifest)
+            .map_err(|error| format!("Could not update package.json: {error}"))?;
+        write_file(service_dir, "package.json", &format!("{updated}\n"))?;
+    }
+    Ok(())
+}
+
+fn add_python_dependencies(
+    service_dir: &Path,
+    dependencies: &[(&str, &str)],
+) -> Result<(), String> {
+    let path = service_dir.join("requirements.txt");
+    let mut contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read requirements.txt: {error}"))?;
+    let mut changed = false;
+
+    for (name, requirement) in dependencies {
+        let normalized_name = name.replace('_', "-").to_ascii_lowercase();
+        let already_present = contents.lines().any(|line| {
+            let package_name = line
+                .trim()
+                .split(|character: char| {
+                    matches!(character, '<' | '>' | '=' | '!' | '[' | ';' | ' ' | '\t')
+                })
+                .next()
+                .unwrap_or_default()
+                .replace('_', "-")
+                .to_ascii_lowercase();
+            package_name == normalized_name
+        });
+        if !already_present {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(requirement);
+            contents.push('\n');
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_file(service_dir, "requirements.txt", &contents)?;
+    }
+    Ok(())
+}
+
+fn add_go_dependencies(service_dir: &Path, dependencies: &[(&str, &str)]) -> Result<(), String> {
+    let path = service_dir.join("go.mod");
+    let mut contents =
+        std::fs::read_to_string(&path).map_err(|error| format!("Could not read go.mod: {error}"))?;
+    let mut changed = false;
+
+    for (module, version) in dependencies {
+        let already_present = contents.lines().any(|line| {
+            let line = line.trim();
+            line.strip_prefix("require ")
+                .unwrap_or(line)
+                .split_whitespace()
+                .next()
+                == Some(*module)
+        });
+        if !already_present {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(&format!("\nrequire {module} {version}\n"));
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_file(service_dir, "go.mod", &contents)?;
+    }
+    Ok(())
+}
+
+fn add_cargo_dependencies(service_dir: &Path, dependencies: &[(&str, &str)]) -> Result<(), String> {
+    let path = service_dir.join("Cargo.toml");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read Cargo.toml: {error}"))?;
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let section_start = lines
+        .iter()
+        .position(|line| line.trim() == "[dependencies]")
+        .ok_or_else(|| "Cargo.toml has no [dependencies] section.".to_string())?;
+    let section_end = lines[section_start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| section_start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    let mut missing = Vec::new();
+    for (name, specification) in dependencies {
+        let exists = lines[section_start + 1..section_end].iter().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == *name)
+        });
+        if !exists {
+            missing.push(format!("{name} = {specification}"));
+        }
+    }
+
+    if !missing.is_empty() {
+        lines.splice(section_end..section_end, missing);
+        write_file(
+            service_dir,
+            "Cargo.toml",
+            &format!("{}\n", lines.join("\n")),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_service_dependencies(
+    service_dir: &Path,
+    rabbitmq: bool,
+    grpc: bool,
+) -> Result<(), String> {
+    let language = detect_service_language(service_dir)
+        .map(|(language, _)| language)
+        .ok_or_else(|| "Could not determine the microservice language.".to_string())?;
+
+    match language {
+        "Node.js" => {
+            let mut dependencies = Vec::new();
+            if rabbitmq {
+                dependencies.push(("amqplib", "^0.10.8"));
+            }
+            if grpc {
+                dependencies.extend([
+                    ("@grpc/grpc-js", "^1.13.4"),
+                    ("@grpc/proto-loader", "^0.7.13"),
+                ]);
+            }
+            add_node_dependencies(service_dir, &dependencies)
+        }
+        "Python" => {
+            let mut dependencies = Vec::new();
+            if rabbitmq {
+                dependencies.push(("pika", "pika>=1.3.2,<2"));
+            }
+            if grpc {
+                dependencies.push(("grpcio", "grpcio>=1.71,<2"));
+            }
+            add_python_dependencies(service_dir, &dependencies)
+        }
+        "Go" => {
+            let mut dependencies = Vec::new();
+            if rabbitmq {
+                dependencies.push(("github.com/rabbitmq/amqp091-go", "v1.10.0"));
+            }
+            if grpc {
+                dependencies.extend([
+                    ("google.golang.org/grpc", "v1.71.0"),
+                    ("google.golang.org/protobuf", "v1.36.6"),
+                ]);
+            }
+            add_go_dependencies(service_dir, &dependencies)
+        }
+        "Rust" => {
+            let mut dependencies = Vec::new();
+            if rabbitmq {
+                dependencies.push(("lapin", "\"2.5\""));
+            }
+            if grpc {
+                dependencies.extend([("tonic", "\"0.13\""), ("prost", "\"0.13\"")]);
+            }
+            add_cargo_dependencies(service_dir, &dependencies)
+        }
+        _ => Err("Unsupported microservice language.".into()),
+    }
+}
+
+fn grpc_target_environment_key(target_service: &str) -> String {
+    format!(
+        "GRPC_TARGET_{}",
+        target_service.replace('-', "_").to_ascii_uppercase()
+    )
+}
+
+fn write_connection_environment(
+    service_dir: &Path,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    let path = service_dir.join(".env");
+    let existing = read_optional_environment_file(&path)?;
     let mut lines = existing
         .lines()
         .filter(|line| {
-            let key = line.split_once('=').map(|(key, _)| key.trim());
-            !key.is_some_and(|key| database_keys.contains(&key))
+            let Some((key, _)) = line.split_once('=') else {
+                return true;
+            };
+            let key = key.trim();
+            !MESSAGE_CONNECTION_ENV_KEYS.contains(&key)
+                && key != "GRPC_LISTEN_ADDRESS"
+                && !key.starts_with("GRPC_TARGET_")
         })
         .map(str::to_string)
         .collect::<Vec<_>>();
-
-    lines.extend(
-        entries
-            .iter()
-            .map(|(key, value)| format!("{key}={value}")),
-    );
+    lines.extend(entries.iter().map(|(key, value)| format!("{key}={value}")));
     write_file(service_dir, ".env", &format!("{}\n", lines.join("\n")))
+}
+
+fn used_brokers(connections: &[ServiceConnection]) -> Result<Vec<BrokerType>, String> {
+    let mut brokers = Vec::new();
+    for connection in connections {
+        match (connection.method, connection.broker) {
+            (ServiceConnectionType::Messaging, Some(broker)) => {
+                if !brokers.contains(&broker) {
+                    brokers.push(broker);
+                }
+            }
+            (ServiceConnectionType::Messaging, None) => {
+                return Err("A messaging connection is missing its broker.".into());
+            }
+            (ServiceConnectionType::Grpc, Some(_)) => {
+                return Err("A gRPC connection cannot specify a message broker.".into());
+            }
+            (ServiceConnectionType::Grpc, None) => {}
+        }
+    }
+    brokers.sort_by_key(|broker| broker.as_str());
+    Ok(brokers)
+}
+
+fn generate_workspace_broker_compose(brokers: &[BrokerType]) -> String {
+    let mut services = String::new();
+    let mut volumes = Vec::new();
+
+    for broker in brokers {
+        match broker {
+            BrokerType::RabbitMq => {
+                services.push_str(
+                    r#"  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASSWORD}"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - micronom-services
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+"#,
+                );
+                volumes.push("  rabbitmq-data: {}\n");
+            }
+            BrokerType::Kafka => {
+                services.push_str(
+                    r#"  kafka:
+    image: apache/kafka:4.1.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - micronom-services
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+    restart: unless-stopped
+"#,
+                );
+                volumes.push("  kafka-data: {}\n");
+            }
+            BrokerType::RedisStreams => {
+                services.push_str(
+                    r#"  redis-streams:
+    image: redis:7-alpine
+    environment:
+      REDIS_STREAMS_PASSWORD: "${REDIS_STREAMS_PASSWORD}"
+      REDISCLI_AUTH: "${REDIS_STREAMS_PASSWORD}"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_STREAMS_PASSWORD}"]
+    volumes:
+      - redis-streams-data:/data
+    networks:
+      - micronom-services
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+"#,
+                );
+                volumes.push("  redis-streams-data: {}\n");
+            }
+        }
+    }
+
+    format!(
+        "services:\n{services}networks:\n  micronom-services:\n    external: true\n    name: micronom-services\nvolumes:\n{}",
+        volumes.join("")
+    )
+}
+
+fn generate_service_connection_compose(service_name: &str, environment_keys: &[String]) -> String {
+    let environment = environment_keys
+        .iter()
+        .map(|key| format!("      {key}: \"${{{key}}}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"services:
+  {service_name}:
+    environment:
+{environment}
+    networks:
+      - micronom-services
+networks:
+  micronom-services:
+    external: true
+    name: micronom-services
+"#
+    )
+}
+
+fn workspace_broker_secrets(
+    app_dir: &Path,
+    brokers: &[BrokerType],
+) -> Result<HashMap<BrokerType, String>, String> {
+    let broker_dir = app_dir.join(".micronom").join("brokers");
+    std::fs::create_dir_all(&broker_dir)
+        .map_err(|error| format!("Could not create workspace broker directory: {error}"))?;
+
+    let env_path = broker_dir.join(".env");
+    let existing = read_optional_environment_file(&env_path)?;
+    let mut entries = Vec::new();
+    let mut secrets = HashMap::new();
+
+    for broker in brokers {
+        match broker {
+            BrokerType::RabbitMq | BrokerType::RedisStreams => {
+                let key = broker.secret_key().ok_or_else(|| {
+                    format!("{} credentials are not configured.", broker.as_str())
+                })?;
+                let password = match read_environment_value(&existing, key) {
+                    Some(value)
+                        if value.len() == 64
+                            && value.chars().all(|character| character.is_ascii_hexdigit()) =>
+                    {
+                        value
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "Invalid stored credentials for {}.",
+                            broker.as_str()
+                        ));
+                    }
+                    None => generate_database_password()?,
+                };
+                if *broker == BrokerType::RabbitMq {
+                    entries.push(("RABBITMQ_USER", "micronom".to_string()));
+                }
+                entries.push((key, password.clone()));
+                secrets.insert(*broker, password);
+            }
+            BrokerType::Kafka => {}
+        }
+    }
+
+    write_environment_file(&broker_dir, ".env", &entries, BROKER_SECRET_ENV_KEYS)?;
+    write_file(&broker_dir, ".gitignore", ".env\n")?;
+    write_file(
+        &broker_dir,
+        "docker-compose.yml",
+        &generate_workspace_broker_compose(brokers),
+    )?;
+
+    Ok(secrets)
+}
+
+fn append_service_connection_documentation(service_dir: &Path) -> Result<(), String> {
+    let path = service_dir.join("README.md");
+    let existing = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read the service README: {error}"))?;
+    if existing
+        .lines()
+        .any(|line| line.trim() == "## Service connections")
+    {
+        return Ok(());
+    }
+
+    let section = r#"
+## Service connections
+
+RabbitMQ connections add the language client dependency and set `RABBITMQ_URL`.
+gRPC connections add the language runtime dependencies, set `GRPC_LISTEN_ADDRESS`
+on the destination, and set a `GRPC_TARGET_<SERVICE>` address on the source.
+Run all installs these dependencies during the Docker image build. These addresses
+use Micronom's shared Docker network. Micronom does not generate publisher/consumer
+or RPC handler code; add that application logic as needed.
+"#;
+    write_file(service_dir, "README.md", &format!("{existing}{section}"))
+}
+
+fn sync_service_connection_artifacts(
+    app_dir: &Path,
+    connections: &[ServiceConnection],
+) -> Result<(), String> {
+    let brokers = used_brokers(connections)?;
+    let secrets = if brokers.is_empty() {
+        HashMap::new()
+    } else {
+        workspace_broker_secrets(app_dir, &brokers)?
+    };
+
+    let mut service_brokers: HashMap<String, Vec<BrokerType>> = HashMap::new();
+    let mut grpc_targets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut grpc_services = HashSet::new();
+    let mut expected_services = Vec::new();
+    for connection in connections {
+        for service_name in [&connection.source_service, &connection.target_service] {
+            if !expected_services.contains(service_name) {
+                expected_services.push(service_name.clone());
+            }
+        }
+
+        match (connection.method, connection.broker) {
+            (ServiceConnectionType::Messaging, Some(broker)) => {
+                for service_name in [&connection.source_service, &connection.target_service] {
+                    let service_broker_types =
+                        service_brokers.entry(service_name.clone()).or_default();
+                    if !service_broker_types.contains(&broker) {
+                        service_broker_types.push(broker);
+                    }
+                }
+            }
+            (ServiceConnectionType::Grpc, None) => {
+                let targets = grpc_targets
+                    .entry(connection.source_service.clone())
+                    .or_default();
+                if !targets.contains(&connection.target_service) {
+                    targets.push(connection.target_service.clone());
+                }
+                grpc_services.insert(connection.source_service.clone());
+                grpc_services.insert(connection.target_service.clone());
+            }
+            (ServiceConnectionType::Messaging, None) => {
+                return Err("A messaging connection is missing its broker.".into());
+            }
+            (ServiceConnectionType::Grpc, Some(_)) => {
+                return Err("A gRPC connection cannot specify a message broker.".into());
+            }
+        }
+    }
+
+    let entries = std::fs::read_dir(app_dir)
+        .map_err(|error| format!("Could not read the app directory: {error}"))?;
+    let mut found_services = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not read an app entry: {error}"))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect an app entry: {error}"))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let service_dir = entry.path();
+        if !service_dir.join("docker-compose.yml").is_file() {
+            continue;
+        }
+        let service_name = entry.file_name().to_string_lossy().into_owned();
+        found_services.push(service_name.clone());
+        let service_broker_types = service_brokers.get(&service_name);
+        let service_grpc_targets = grpc_targets.get(&service_name);
+        let has_grpc = grpc_services.contains(&service_name);
+        let has_connection = service_broker_types.is_some() || has_grpc;
+        let env_path = service_dir.join(".env");
+        if has_connection && !env_path.is_file() {
+            return Err(format!(
+                "The environment file is missing for service {service_name}."
+            ));
+        }
+
+        if has_connection {
+            let rabbitmq = service_broker_types
+                .is_some_and(|service_brokers| service_brokers.contains(&BrokerType::RabbitMq));
+            ensure_service_dependencies(&service_dir, rabbitmq, has_grpc)?;
+
+            let mut env_entries = Vec::new();
+            if let Some(service_broker_types) = service_broker_types {
+                for broker in service_broker_types {
+                    let secret = secrets.get(broker).map(String::as_str);
+                    env_entries.push((broker.env_key().to_string(), broker.connection_url(secret)?));
+                }
+            }
+            if let Some(targets) = service_grpc_targets {
+                for target in targets {
+                    env_entries.push((
+                        grpc_target_environment_key(target),
+                        format!("{target}:50051"),
+                    ));
+                }
+            }
+            if has_grpc {
+                env_entries.push(("GRPC_LISTEN_ADDRESS".into(), "0.0.0.0:50051".into()));
+            }
+            write_connection_environment(&service_dir, &env_entries)?;
+            exclude_database_metadata_from_build_context(&service_dir)?;
+            append_service_connection_documentation(&service_dir)?;
+            let environment_keys = env_entries
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            write_file(
+                &service_dir,
+                "docker-compose.connections.yml",
+                &generate_service_connection_compose(&service_name, &environment_keys),
+            )?;
+        } else {
+            if env_path.is_file() {
+                write_connection_environment(&service_dir, &[])?;
+            }
+            match std::fs::remove_file(service_dir.join("docker-compose.connections.yml")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Could not remove messaging configuration for {service_name}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(missing) = expected_services
+        .iter()
+        .find(|service_name| !found_services.contains(service_name))
+    {
+        return Err(format!(
+            "Connected service {missing} does not have a Docker Compose file."
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 48
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+fn resolve_service_directory(app_dir: &Path, service_name: &str) -> Result<PathBuf, String> {
+    if !is_valid_service_name(service_name) {
+        return Err("Invalid microservice name.".into());
+    }
+
+    let canonical_app = app_dir
+        .canonicalize()
+        .map_err(|error| format!("Could not access the app directory: {error}"))?;
+    let canonical_service = app_dir
+        .join(service_name)
+        .canonicalize()
+        .map_err(|error| format!("Could not access service {service_name}: {error}"))?;
+    if canonical_service.parent() != Some(canonical_app.as_path())
+        || !canonical_service.is_dir()
+        || !canonical_service.join("docker-compose.yml").is_file()
+    {
+        return Err(format!("Invalid microservice directory: {service_name}."));
+    }
+
+    Ok(canonical_service)
+}
+
+fn configure_service_connection(connection: ServiceConnection) -> Result<(), String> {
+    if connection.id == 0 {
+        return Err("Invalid connection identifier.".into());
+    }
+    if connection.source_service == connection.target_service {
+        return Err("A service cannot connect to itself.".into());
+    }
+
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "Could not find the user home directory.".to_string())?;
+    let app_dir = PathBuf::from(home).join("app");
+    resolve_service_directory(&app_dir, &connection.source_service)?;
+    resolve_service_directory(&app_dir, &connection.target_service)?;
+
+    let mut connections = read_service_connections(&app_dir)?;
+    if connections.iter().any(|existing| {
+        existing.id == connection.id
+            || (existing.source_service == connection.source_service
+                && existing.target_service == connection.target_service
+                && existing.method == connection.method
+                && existing.broker == connection.broker)
+    }) {
+        return Err("This service connection is already configured.".into());
+    }
+
+    connections.push(connection);
+    sync_service_connection_artifacts(&app_dir, &connections)?;
+    write_service_connections(&app_dir, &connections)
+}
+
+#[tauri::command]
+fn configure_message_connection(
+    connection_id: u64,
+    source_service: String,
+    target_service: String,
+    broker: BrokerType,
+) -> Result<(), String> {
+    configure_service_connection(ServiceConnection {
+        id: connection_id,
+        source_service,
+        target_service,
+        method: ServiceConnectionType::Messaging,
+        broker: Some(broker),
+    })
+}
+
+#[tauri::command]
+fn configure_grpc_connection(
+    connection_id: u64,
+    source_service: String,
+    target_service: String,
+) -> Result<(), String> {
+    configure_service_connection(ServiceConnection {
+        id: connection_id,
+        source_service,
+        target_service,
+        method: ServiceConnectionType::Grpc,
+        broker: None,
+    })
 }
 
 fn add_faiss_dependency(service_dir: &Path) -> Result<(), String> {
@@ -1459,6 +2563,7 @@ fn run_compose(
     service_dir: &Path,
     name: &str,
     action: &str,
+    wait_for_healthy: bool,
 ) -> Result<ExitStatus, String> {
     emit_service_progress(
         app,
@@ -1472,10 +2577,14 @@ fn run_compose(
 
     let mut command = Command::new("docker");
     command.arg("compose");
-    if service_dir.join("docker-compose.db.yml").is_file() {
-        command.args(["-f", "docker-compose.yml", "-f", "docker-compose.db.yml"]);
-    } else {
-        command.args(["-f", "docker-compose.yml"]);
+    for compose_file in [
+        "docker-compose.yml",
+        "docker-compose.db.yml",
+        "docker-compose.connections.yml",
+    ] {
+        if compose_file == "docker-compose.yml" || service_dir.join(compose_file).is_file() {
+            command.args(["-f", compose_file]);
+        }
     }
 
     if action == "up" {
@@ -1484,10 +2593,14 @@ fn run_compose(
             "plain",
             "up",
             "--build",
+            "--remove-orphans",
             "-d",
         ]);
+        if wait_for_healthy {
+            command.args(["--wait", "--wait-timeout", "180"]);
+        }
     } else {
-        command.arg("down");
+        command.args(["down", "--remove-orphans"]);
     }
 
     let mut child = command
@@ -1538,6 +2651,41 @@ fn run_compose(
     status
 }
 
+fn ensure_shared_service_network() -> Result<(), String> {
+    let inspect = Command::new("docker")
+        .args(["network", "inspect", "micronom-services"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not inspect Docker networks: {error}"))?;
+    if inspect.success() {
+        return Ok(());
+    }
+
+    let create = Command::new("docker")
+        .args(["network", "create", "micronom-services"])
+        .output()
+        .map_err(|error| format!("Could not create the shared service network: {error}"))?;
+    if create.status.success() {
+        return Ok(());
+    }
+
+    let inspect_after_create = Command::new("docker")
+        .args(["network", "inspect", "micronom-services"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not verify the shared service network: {error}"))?;
+    if inspect_after_create.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Could not create the shared service network: {}",
+        String::from_utf8_lossy(&create.stderr).trim()
+    ))
+}
+
 fn manage_all_services(
     action: &str,
     app: &tauri::AppHandle,
@@ -1560,6 +2708,54 @@ fn manage_all_services(
         .map_err(|e| format!("Could not read app directory: {e}"))?;
 
     let mut results = Vec::new();
+    let service_connections = read_service_connections(&canonical_app)?;
+    let broker_dir = canonical_app.join(".micronom").join("brokers");
+    let broker_compose = broker_dir.join("docker-compose.yml");
+    let has_messaging_connections = service_connections
+        .iter()
+        .any(|connection| connection.method == ServiceConnectionType::Messaging);
+
+    if action == "up" && !service_connections.is_empty() {
+        ensure_shared_service_network()?;
+    }
+
+    if action == "up" && has_messaging_connections {
+        if !broker_compose.is_file() {
+            return Err(
+                "Messaging connections exist but the shared broker configuration is missing."
+                    .into(),
+            );
+        }
+
+        match run_compose(app, &broker_dir, "Workspace brokers", "up", true) {
+            Ok(status) if status.success() => {
+                emit_service_progress(
+                    app,
+                    "Workspace brokers",
+                    "Shared brokers are healthy.".into(),
+                );
+            }
+            Ok(status) => {
+                let message = format!("Docker operation failed ({status}).");
+                emit_service_progress(app, "Workspace brokers", message.clone());
+                results.push(ServiceActionResult {
+                    name: "Workspace brokers".into(),
+                    success: false,
+                    message,
+                });
+                return Ok(results);
+            }
+            Err(message) => {
+                emit_service_progress(app, "Workspace brokers", message.clone());
+                results.push(ServiceActionResult {
+                    name: "Workspace brokers".into(),
+                    success: false,
+                    message,
+                });
+                return Ok(results);
+            }
+        }
+    }
 
     for entry in entries {
         let entry = match entry {
@@ -1587,7 +2783,7 @@ fn manage_all_services(
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        match run_compose(app, &service_dir, &name, action) {
+        match run_compose(app, &service_dir, &name, action, false) {
             Ok(status) => {
                 let success = status.success();
                 let message = if success {
@@ -1606,6 +2802,33 @@ fn manage_all_services(
                 emit_service_progress(app, &name, message.clone());
                 results.push(ServiceActionResult {
                     name,
+                    success: false,
+                    message,
+                });
+            }
+        }
+    }
+
+    if action == "down" && broker_compose.is_file() {
+        match run_compose(app, &broker_dir, "Workspace brokers", "down", false) {
+            Ok(status) => {
+                let success = status.success();
+                let message = if success {
+                    "Shared brokers stopped; their data volumes were kept.".into()
+                } else {
+                    format!("Docker operation failed ({status}).")
+                };
+                emit_service_progress(app, "Workspace brokers", message.clone());
+                results.push(ServiceActionResult {
+                    name: "Workspace brokers".into(),
+                    success,
+                    message,
+                });
+            }
+            Err(message) => {
+                emit_service_progress(app, "Workspace brokers", message.clone());
+                results.push(ServiceActionResult {
+                    name: "Workspace brokers".into(),
                     success: false,
                     message,
                 });
